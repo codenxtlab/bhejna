@@ -26,6 +26,10 @@ func NewWorkerPool(database *db.DB, limiters *LimiterManager, metaClient *MetaAP
 	}
 }
 
+func (p *WorkerPool) Stop() {
+	p.wg.Wait()
+}
+
 func (p *WorkerPool) Start(ctx context.Context) {
 	for i := 0; i < p.workerCount; i++ {
 		p.wg.Add(1)

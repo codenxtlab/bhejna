@@ -148,3 +148,37 @@ func (db *DB) GetStaleJobs(threshold time.Duration) ([]Job, error) {
 	}
 	return jobs, nil
 }
+
+// GetTenantByAccessToken retrieves a tenant by their API key.
+func (db *DB) GetTenantByAccessToken(token string) (*Tenant, error) {
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused FROM tenants WHERE access_token = ?`
+	var t Tenant
+	err := db.Reader.QueryRow(query, token).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// InsertJob enqueues a new message job.
+func (db *DB) InsertJob(j *Job) error {
+	query := `INSERT INTO jobs (id, tenant_id, recipient_phone, message_type, message_payload, status, status_level, next_retry_at) 
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := db.Writer.Exec(query, j.ID, j.TenantID, j.RecipientPhone, j.MessageType, j.MessagePayload, j.Status, j.StatusLevel, j.NextRetryAt)
+	return err
+}
+
+// InsertTenant provisions a new tenant.
+func (db *DB) InsertTenant(t *Tenant) error {
+	query := `INSERT INTO tenants (id, waba_id, phone_number_id, access_token) VALUES (?, ?, ?, ?)`
+	_, err := db.Writer.Exec(query, t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken)
+	return err
+}
+
+// InsertWebhookEvent records a raw Meta event.
+func (db *DB) InsertWebhookEvent(e *WebhookEvent) error {
+	query := `INSERT INTO webhook_events (id, idempotency_key, waba_id, event_type, raw_payload, is_matched) 
+	          VALUES (?, ?, ?, ?, ?, ?)`
+	_, err := db.Writer.Exec(query, e.ID, e.IdempotencyKey, e.WabaID, e.EventType, e.RawPayload, e.IsMatched)
+	return err
+}
