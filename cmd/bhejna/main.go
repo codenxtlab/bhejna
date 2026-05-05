@@ -14,9 +14,19 @@ import (
 	"github.com/codenxtlab/bhejna/internal/engine"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// 0. Load Environment Variables from file
+	envFile := ".env"
+	if os.Getenv("GO_ENV") == "production" {
+		envFile = ".env.production"
+	}
+	if err := godotenv.Load(envFile); err != nil {
+		log.Printf("Warning: Error loading %s file: %v (relying on system env)", envFile, err)
+	}
+
 	// 1. Load configuration from environment
 	dbPath := getEnv("DB_PATH", "bhejna.db")
 	port := getEnv("PORT", "8080")
