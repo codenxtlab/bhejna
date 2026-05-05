@@ -182,3 +182,70 @@ func (db *DB) InsertWebhookEvent(e *WebhookEvent) error {
 	_, err := db.Writer.Exec(query, e.ID, e.IdempotencyKey, e.WabaID, e.EventType, e.RawPayload, e.IsMatched)
 	return err
 }
+// GetUnsyncedJobs selects up to limit jobs that are in a terminal state and haven't been synced.
+func (db *DB) GetUnsyncedJobs(limit int) ([]Job, error) {
+	query := `
+		SELECT id, tenant_id, recipient_phone, message_type, status, meta_error_code, created_at 
+		FROM jobs 
+		WHERE synced = 0 
+		  AND status IN ('delivered', 'read', 'failed')
+		LIMIT ?`
+
+	rows, err := db.Reader.Query(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var j Job
+		if err := rows.Scan(&j.ID, &j.TenantID, &j.RecipientPhone, &j.MessageType, &j.Status, &j.MetaErrorCode, &j.CreatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
+// MarkJobsSynced updates the synced flag to 1 for the given slice of job IDs.
+func (db *DB) MarkJobsSynced(jobIDs []string) error {
+	if len(jobIDs) == 0 {
+		return nil
+	}
+
+	// SQLite supports up to 999 variables by default, but for simplicity we'll 
+	// just execute them in a single transaction if needed, or use a single query if small.
+	// For this worker, the limit is likely small (e.g. 100).
+	query := `UPDATE jobs SET synced = 1 WHERE id = ?`
+	
+	tx, err := db.Writer.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(query)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, id := range jobIDs {
+		if _, err := stmt.Exec(id); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// DeleteOldSyncedJobs purges jobs that are already synced and older than the specified days.
+func (db *DB) DeleteOldSyncedJobs(days int) (int64, error) {
+	query := `DELETE FROM jobs WHERE synced = 1 AND created_at < datetime('now', '-' || ? || ' days')`
+	res, err := db.Writer.Exec(query, days)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
