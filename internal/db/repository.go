@@ -71,3 +71,80 @@ func (db *DB) RequeueWithJitter(jobID string) error {
 	_, err := db.Writer.Exec(query, nextRetry, jobID)
 	return err
 }
+
+// GetTenant retrieves tenant details.
+func (db *DB) GetTenant(id string) (*Tenant, error) {
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused FROM tenants WHERE id = ?`
+	var t Tenant
+	err := db.Reader.QueryRow(query, id).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused)
+	return &t, err
+}
+
+// PauseTenant disables a tenant for policy violations.
+func (db *DB) PauseTenant(id string, reason string) error {
+	query := `UPDATE tenants SET is_paused = 1, pause_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	_, err := db.Writer.Exec(query, reason, id)
+	return err
+}
+
+// UpdateJobStatus updates the status of a job by ID.
+func (db *DB) UpdateJobStatus(id string, status string, level int) error {
+	query := `UPDATE jobs SET status = ?, status_level = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	_, err := db.Writer.Exec(query, status, level, id)
+	return err
+}
+
+// SetJobMetaID binds the Meta WAMID to our internal job record.
+func (db *DB) SetJobMetaID(id string, metaID string) error {
+	query := `UPDATE jobs SET meta_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	_, err := db.Writer.Exec(query, metaID, id)
+	return err
+}
+
+// GetUnmatchedEvents returns events that haven't been reconciled yet.
+func (db *DB) GetUnmatchedEvents() ([]WebhookEvent, error) {
+	query := `SELECT id, raw_payload FROM webhook_events WHERE is_matched = 0 LIMIT 100`
+	rows, err := db.Reader.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []WebhookEvent
+	for rows.Next() {
+		var e WebhookEvent
+		if err := rows.Scan(&e.ID, &e.RawPayload); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+// MarkEventMatched marks a webhook event as processed.
+func (db *DB) MarkEventMatched(id string) error {
+	query := `UPDATE webhook_events SET is_matched = 1 WHERE id = ?`
+	_, err := db.Writer.Exec(query, id)
+	return err
+}
+
+// GetStaleJobs finds jobs stuck in 'accepted' status for too long.
+func (db *DB) GetStaleJobs(threshold time.Duration) ([]Job, error) {
+	cutoff := time.Now().Add(-threshold)
+	query := `SELECT id, tenant_id, updated_at FROM jobs WHERE status = 'accepted' AND updated_at < ?`
+	rows, err := db.Reader.Query(query, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var j Job
+		if err := rows.Scan(&j.ID, &j.TenantID, &j.UpdatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
