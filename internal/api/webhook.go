@@ -16,19 +16,44 @@ var statusLevels = map[string]int{
 	"failed":    0,
 }
 
-// MetaWebhookPayload represents the structure of Meta's POST webhook.
-type MetaWebhookPayload struct {
-	Object string `json:"object"`
+// WebhookPayload represents the root JSON sent by Meta.
+type WebhookPayload struct {
+	Object string `json:"object"` // Usually "whatsapp_business_account"
 	Entry  []struct {
-		ID      string `json:"id"`
+		ID      string `json:"id"` // WABA ID
 		Changes []struct {
+			Field string `json:"field"` // Usually "messages"
 			Value struct {
+				MessagingProduct string `json:"messaging_product"`
+				Metadata         struct {
+					DisplayPhoneNumber string `json:"display_phone_number"`
+					PhoneNumberID      string `json:"phone_number_id"`
+				} `json:"metadata"`
+                
+				// Statuses represents delivery receipts (sent, delivered, read, failed)
 				Statuses []struct {
-					ID     string `json:"id"`
-					Status string `json:"status"`
-				} `json:"statuses"`
+					ID          string `json:"id"`     // The wamid
+					Status      string `json:"status"` 
+					Timestamp   string `json:"timestamp"`
+					RecipientID string `json:"recipient_id"`
+					Errors      []struct {
+						Code  int    `json:"code"`
+						Title string `json:"title"`
+					} `json:"errors,omitempty"`
+				} `json:"statuses,omitempty"`
+                
+				// Messages represents actual inbound text/media from the user
+				Messages []struct {
+					From      string `json:"from"`
+					ID        string `json:"id"` // Inbound wamid
+					Timestamp string `json:"timestamp"`
+					Type      string `json:"type"` // "text", "image", etc.
+					Text      struct {
+						Body string `json:"body"`
+					} `json:"text,omitempty"`
+				} `json:"messages,omitempty"`
+                
 			} `json:"value"`
-			Field string `json:"field"`
 		} `json:"changes"`
 	} `json:"entry"`
 }
@@ -60,7 +85,7 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 			return
 		}
 
-		var payload MetaWebhookPayload
+		var payload WebhookPayload
 		if err := json.Unmarshal(body, &payload); err != nil {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -69,6 +94,7 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 		// Fast Path Sweep
 		for _, entry := range payload.Entry {
 			for _, change := range entry.Changes {
+				// 1. Check for Outbound Status Updates (Delivery Receipts)
 				for _, status := range change.Value.Statuses {
 					level, exists := statusLevels[status.Status]
 					if !exists {
@@ -91,6 +117,17 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 					}
 
 					_ = database.InsertWebhookEvent(event)
+				}
+
+				// 2. Check for Inbound Messages (User replied)
+				for _, msg := range change.Value.Messages {
+					phoneID := change.Value.Metadata.PhoneNumberID
+					if phoneID != "" {
+						tenant, err := database.GetTenantByPhoneNumberID(phoneID)
+						if err == nil && tenant != nil {
+							_ = database.UpsertActiveSession(tenant.ID, msg.From)
+						}
+					}
 				}
 			}
 		}

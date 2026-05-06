@@ -168,10 +168,27 @@ func (db *DB) InsertJob(j *Job) error {
 	return err
 }
 
-// InsertTenant provisions a new tenant.
+// InsertTenant provisions or syncs a tenant.
 func (db *DB) InsertTenant(t *Tenant) error {
-	query := `INSERT INTO tenants (id, waba_id, phone_number_id, access_token) VALUES (?, ?, ?, ?)`
-	_, err := db.Writer.Exec(query, t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken)
+	query := `
+		INSERT INTO tenants (
+			id, waba_id, phone_number_id, access_token, 
+			messaging_limit, quality_rating, is_paused
+		) 
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET 
+			waba_id = excluded.waba_id,
+			phone_number_id = excluded.phone_number_id,
+			access_token = excluded.access_token,
+			messaging_limit = excluded.messaging_limit,
+			quality_rating = excluded.quality_rating,
+			is_paused = excluded.is_paused,
+			updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := db.Writer.Exec(query, 
+		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken, 
+		t.MessagingLimit, t.QualityRating, t.IsPaused,
+	)
 	return err
 }
 
@@ -248,4 +265,26 @@ func (db *DB) DeleteOldSyncedJobs(days int) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// GetTenantByPhoneNumberID retrieves a tenant by their Meta Phone Number ID.
+func (db *DB) GetTenantByPhoneNumberID(phoneID string) (*Tenant, error) {
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused FROM tenants WHERE phone_number_id = ?`
+	var t Tenant
+	err := db.Reader.QueryRow(query, phoneID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// UpsertActiveSession updates or inserts a 24-hour active session.
+func (db *DB) UpsertActiveSession(tenantID, recipientPhone string) error {
+	query := `
+		INSERT INTO active_sessions (tenant_id, recipient_phone, expires_at) 
+		VALUES (?, ?, datetime('now', '+24 hours')) 
+		ON CONFLICT(tenant_id, recipient_phone) 
+		DO UPDATE SET expires_at = datetime('now', '+24 hours')`
+	_, err := db.Writer.Exec(query, tenantID, recipientPhone)
+	return err
 }

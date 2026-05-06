@@ -6,17 +6,17 @@ import (
 )
 
 type Tenant struct {
-	ID             string         `db:"id"`
-	WabaID         string         `db:"waba_id"`
-	PhoneNumberID  string         `db:"phone_number_id"`
-	AccessToken    string         `db:"access_token"`
-	MessagingLimit int            `db:"messaging_limit"`
-	QualityRating  string         `db:"quality_rating"`
-	IsPaused       bool           `db:"is_paused"`
-	PausedUntil    sql.NullTime   `db:"paused_until"`
-	PauseReason    sql.NullString `db:"pause_reason"`
-	CreatedAt      time.Time      `db:"created_at"`
-	UpdatedAt      time.Time      `db:"updated_at"`
+	ID             string         `db:"id" json:"id"`
+	WabaID         string         `db:"waba_id" json:"waba_id"`
+	PhoneNumberID  string         `db:"phone_number_id" json:"phone_number_id"`
+	AccessToken    string         `db:"access_token" json:"access_token"`
+	MessagingLimit int            `db:"messaging_limit" json:"messaging_limit"`
+	QualityRating  string         `db:"quality_rating" json:"quality_rating"`
+	IsPaused       bool           `db:"is_paused" json:"is_paused"`
+	PausedUntil    sql.NullTime   `db:"paused_until" json:"-"`
+	PauseReason    sql.NullString `db:"pause_reason" json:"-"`
+	CreatedAt      time.Time      `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
 }
 
 type Job struct {

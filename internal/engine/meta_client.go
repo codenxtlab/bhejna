@@ -20,15 +20,57 @@ func NewMetaAPIClient() *MetaAPIClient {
 	}
 }
 
-// MetaResponse represents the success response from WhatsApp Cloud API.
-type MetaResponse struct {
+// --- REQUEST STRUCTS ---
+
+type SendMessagePayload struct {
+	MessagingProduct string           `json:"messaging_product"` // Always "whatsapp"
+	RecipientType    string           `json:"recipient_type"`    // Always "individual"
+	To               string           `json:"to"`
+	Type             string           `json:"type"`              // "text" or "template"
+	Text             *TextContent     `json:"text,omitempty"`
+	Template         *TemplateContent `json:"template,omitempty"`
+}
+
+type TextContent struct {
+	PreviewURL bool   `json:"preview_url"`
+	Body       string `json:"body"`
+}
+
+type TemplateContent struct {
+	Name       string             `json:"name"`
+	Language   TemplateLanguage   `json:"language"`
+	Components []TemplateComponent `json:"components,omitempty"`
+}
+
+type TemplateLanguage struct {
+	Code string `json:"code"` // e.g., "en_US"
+}
+
+type TemplateComponent struct {
+	Type       string             `json:"type"` // "header", "body", "button"
+	Parameters []TemplateParameter `json:"parameters"`
+}
+
+type TemplateParameter struct {
+	Type string `json:"type"` // "text", "currency", "image", etc.
+	Text string `json:"text,omitempty"`
+}
+
+// --- RESPONSE STRUCTS ---
+
+// MetaMessageResponse is what Meta returns on a 200 OK.
+type MetaMessageResponse struct {
 	MessagingProduct string `json:"messaging_product"`
-	Messages         []struct {
-		ID string `json:"id"`
+	Contacts         []struct {
+		Input string `json:"input"`
+		WaID  string `json:"wa_id"`
+	} `json:"contacts"`
+	Messages []struct {
+		ID string `json:"id"` // This is the wamid.HBg... you need to save
 	} `json:"messages"`
 }
 
-// MetaErrorResponse represents an error response from WhatsApp Cloud API.
+// MetaErrorResponse is what Meta returns on 4xx/5xx errors.
 type MetaErrorResponse struct {
 	Error struct {
 		Message   string `json:"message"`
@@ -37,7 +79,7 @@ type MetaErrorResponse struct {
 		ErrorData struct {
 			Details string `json:"details"`
 		} `json:"error_data"`
-		FBTraceID string `json:"fbtrace_id"`
+		ErrorSubcode int `json:"error_subcode"` // Critical for identifying 131048 limits
 	} `json:"error"`
 }
 
@@ -82,7 +124,7 @@ func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumber
 		}
 	}
 
-	var metaResp MetaResponse
+	var metaResp MetaMessageResponse
 	if err := json.Unmarshal(body, &metaResp); err != nil {
 		return "", fmt.Errorf("failed to decode meta response: %v", err)
 	}

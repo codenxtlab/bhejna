@@ -82,7 +82,7 @@ func main() {
 	// Group 3: Internal routes
 	r.Group(func(r chi.Router) {
 		r.Use(api.InternalJWTMiddleware(internalSecret))
-		r.Post("/api/internal/tenants", api.HandleProvisionTenant(database))
+		r.Post("/api/internal/sync-tenant", api.HandleSyncTenant(database))
 		r.Put("/api/internal/tenants/{id}/pause", api.HandlePauseTenant(database))
 	})
 

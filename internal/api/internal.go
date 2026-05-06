@@ -2,54 +2,49 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/codenxtlab/bhejna/internal/db"
 	"github.com/go-chi/chi/v5"
-	"github.com/oklog/ulid/v2"
 )
 
-type ProvisionTenantRequest struct {
-	WabaID        string `json:"waba_id"`
-	PhoneNumberID string `json:"phone_number_id"`
-}
-
-type ProvisionTenantResponse struct {
-	TenantID    string `json:"tenant_id"`
-	AccessToken string `json:"access_token"`
-}
-
-// HandleProvisionTenant creates a new tenant and generates an API key.
-func HandleProvisionTenant(database *db.DB) http.HandlerFunc {
+// HandleSyncTenant processes a Supabase Database Webhook to cache a tenant locally.
+func HandleSyncTenant(database *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var req ProvisionTenantRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Read the body once so we can try multiple unmarshal strategies
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
 		}
 
-		tenantID := ulid.Make().String()
-		apiKey := fmt.Sprintf("nxt_live_%s", ulid.Make().String())
-
-		tenant := &db.Tenant{
-			ID:            tenantID,
-			WabaID:        req.WabaID,
-			PhoneNumberID: req.PhoneNumberID,
-			AccessToken:   apiKey,
+		// Option 1: Supabase Webhook payload format
+		var webhookPayload struct {
+			Record *db.Tenant `json:"record"`
 		}
 
+		var tenant *db.Tenant
+		
+		if err := json.Unmarshal(bodyBytes, &webhookPayload); err == nil && webhookPayload.Record != nil && webhookPayload.Record.ID != "" {
+			tenant = webhookPayload.Record
+		} else {
+			// Option 2: Direct Tenant payload format
+			var directTenant db.Tenant
+			if err := json.Unmarshal(bodyBytes, &directTenant); err != nil || directTenant.ID == "" {
+				http.Error(w, "Bad Request: invalid payload", http.StatusBadRequest)
+				return
+			}
+			tenant = &directTenant
+		}
+
+		// UPSERT the tenant into local SQLite
 		if err := database.InsertTenant(tenant); err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(ProvisionTenantResponse{
-			TenantID:    tenantID,
-			AccessToken: apiKey,
-		})
+		w.WriteHeader(http.StatusOK)
 	}
 }
 
