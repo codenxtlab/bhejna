@@ -56,6 +56,10 @@ func main() {
 	// 4. Start Worker Pool
 	pool.Start(ctx)
 
+	// 4.5 Start Client Webhook Pool
+	webhookPool := engine.NewClientWebhookPool(database)
+	webhookPool.Start(ctx, 10)
+
 	// 5. Start Janitors
 	go engine.StartJanitor(ctx, database)
 	go engine.StartSupabaseSync(ctx, database, supabaseURL, supabaseAnonKey)

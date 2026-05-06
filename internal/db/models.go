@@ -17,6 +17,8 @@ type Tenant struct {
 	PauseReason    sql.NullString `db:"pause_reason" json:"-"`
 	CreatedAt      time.Time      `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
+	WebhookURL     sql.NullString `db:"webhook_url" json:"webhook_url"`
+	WebhookSecret  sql.NullString `db:"webhook_secret" json:"-"`
 }
 
 type Job struct {
@@ -32,6 +34,7 @@ type Job struct {
 	RetryCount     int            `db:"retry_count"`
 	NextRetryAt    time.Time      `db:"next_retry_at"`
 	Synced         bool           `db:"synced"`
+	IdempotencyKey *string        `db:"idempotency_key"`
 	CreatedAt      time.Time      `db:"created_at"`
 	UpdatedAt      time.Time      `db:"updated_at"`
 }
@@ -50,4 +53,16 @@ type ActiveSession struct {
 	TenantID       string    `db:"tenant_id"`
 	RecipientPhone string    `db:"recipient_phone"`
 	ExpiresAt      time.Time `db:"expires_at"`
+}
+
+type ClientWebhookJob struct {
+	ID            string    `db:"id"`
+	TenantID      string    `db:"tenant_id"`
+	Payload       string    `db:"payload"`
+	Status        string    `db:"status"`
+	RetryCount    int       `db:"retry_count"`
+	NextRetryAt   time.Time `db:"next_retry_at"`
+	CreatedAt     time.Time `db:"created_at"`
+	WebhookURL    string    `db:"webhook_url"`    // Joined from tenants
+	WebhookSecret string    `db:"webhook_secret"` // Joined from tenants
 }

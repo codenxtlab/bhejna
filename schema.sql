@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS tenants (
     paused_until DATETIME,
     pause_reason TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    webhook_url TEXT,
+    webhook_secret TEXT
 );
 
 -- Jobs table for message dispatching
@@ -27,9 +29,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     retry_count INTEGER DEFAULT 0,
     next_retry_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     synced BOOLEAN DEFAULT 0,
+    idempotency_key TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id),
+    UNIQUE(tenant_id, idempotency_key)
 );
 
 -- Webhook events for idempotency and matching
@@ -52,8 +56,23 @@ CREATE TABLE IF NOT EXISTS active_sessions (
     FOREIGN KEY (tenant_id) REFERENCES tenants(id)
 );
 
+-- Client webhook queue for event egress
+CREATE TABLE IF NOT EXISTS client_webhook_queue (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT DEFAULT 'queued',
+    retry_count INTEGER DEFAULT 0,
+    next_retry_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+);
+
 -- Optimized Indexes
 CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(next_retry_at, created_at) 
+WHERE status = 'queued';
+
+CREATE INDEX IF NOT EXISTS idx_webhook_queue_claim ON client_webhook_queue(next_retry_at, created_at) 
 WHERE status = 'queued';
 
 CREATE INDEX IF NOT EXISTS idx_jobs_wamid ON jobs(meta_message_id) 

@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -40,6 +41,12 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 			return
 		}
 
+		idempotencyKey := r.Header.Get("Idempotency-Key")
+		var idempotencyPtr *string
+		if idempotencyKey != "" {
+			idempotencyPtr = &idempotencyKey
+		}
+
 		jobID := ulid.Make().String()
 		job := &db.Job{
 			ID:             jobID,
@@ -50,9 +57,19 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 			Status:         "queued",
 			StatusLevel:    0,
 			NextRetryAt:    time.Now(),
+			IdempotencyKey: idempotencyPtr,
 		}
 
 		if err := database.InsertJob(job); err != nil {
+			if errors.Is(err, db.ErrIdempotencyConflict) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				json.NewEncoder(w).Encode(SendMessageResponse{
+					JobID:  "existing",
+					Status: "queued",
+				})
+				return
+			}
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}

@@ -2,9 +2,15 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"math/rand"
+	"strings"
 	"time"
+
+	"github.com/oklog/ulid/v2"
 )
+
+var ErrIdempotencyConflict = errors.New("idempotency key already exists")
 
 // ClaimNextJob finds the oldest 'queued' job for an active tenant and marks it 'processing'.
 func (db *DB) ClaimNextJob() (*Job, error) {
@@ -74,9 +80,9 @@ func (db *DB) RequeueWithJitter(jobID string) error {
 
 // GetTenant retrieves tenant details.
 func (db *DB) GetTenant(id string) (*Tenant, error) {
-	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused FROM tenants WHERE id = ?`
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE id = ?`
 	var t Tenant
-	err := db.Reader.QueryRow(query, id).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused)
+	err := db.Reader.QueryRow(query, id).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
 	return &t, err
 }
 
@@ -151,9 +157,9 @@ func (db *DB) GetStaleJobs(threshold time.Duration) ([]Job, error) {
 
 // GetTenantByAccessToken retrieves a tenant by their API key.
 func (db *DB) GetTenantByAccessToken(token string) (*Tenant, error) {
-	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused FROM tenants WHERE access_token = ?`
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE access_token = ?`
 	var t Tenant
-	err := db.Reader.QueryRow(query, token).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused)
+	err := db.Reader.QueryRow(query, token).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -162,10 +168,16 @@ func (db *DB) GetTenantByAccessToken(token string) (*Tenant, error) {
 
 // InsertJob enqueues a new message job.
 func (db *DB) InsertJob(j *Job) error {
-	query := `INSERT INTO jobs (id, tenant_id, recipient_phone, message_type, message_payload, status, status_level, next_retry_at) 
-	          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := db.Writer.Exec(query, j.ID, j.TenantID, j.RecipientPhone, j.MessageType, j.MessagePayload, j.Status, j.StatusLevel, j.NextRetryAt)
-	return err
+	query := `INSERT INTO jobs (id, tenant_id, recipient_phone, message_type, message_payload, status, status_level, next_retry_at, idempotency_key) 
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := db.Writer.Exec(query, j.ID, j.TenantID, j.RecipientPhone, j.MessageType, j.MessagePayload, j.Status, j.StatusLevel, j.NextRetryAt, j.IdempotencyKey)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") && strings.Contains(err.Error(), "idempotency_key") {
+			return ErrIdempotencyConflict
+		}
+		return err
+	}
+	return nil
 }
 
 // InsertTenant provisions or syncs a tenant.
@@ -173,9 +185,10 @@ func (db *DB) InsertTenant(t *Tenant) error {
 	query := `
 		INSERT INTO tenants (
 			id, waba_id, phone_number_id, access_token, 
-			messaging_limit, quality_rating, is_paused
+			messaging_limit, quality_rating, is_paused,
+			webhook_url, webhook_secret
 		) 
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET 
 			waba_id = excluded.waba_id,
 			phone_number_id = excluded.phone_number_id,
@@ -183,11 +196,14 @@ func (db *DB) InsertTenant(t *Tenant) error {
 			messaging_limit = excluded.messaging_limit,
 			quality_rating = excluded.quality_rating,
 			is_paused = excluded.is_paused,
+			webhook_url = COALESCE(excluded.webhook_url, tenants.webhook_url),
+			webhook_secret = COALESCE(excluded.webhook_secret, tenants.webhook_secret),
 			updated_at = CURRENT_TIMESTAMP
 	`
 	_, err := db.Writer.Exec(query, 
 		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken, 
 		t.MessagingLimit, t.QualityRating, t.IsPaused,
+		t.WebhookURL, t.WebhookSecret,
 	)
 	return err
 }
@@ -269,9 +285,20 @@ func (db *DB) DeleteOldSyncedJobs(days int) (int64, error) {
 
 // GetTenantByPhoneNumberID retrieves a tenant by their Meta Phone Number ID.
 func (db *DB) GetTenantByPhoneNumberID(phoneID string) (*Tenant, error) {
-	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused FROM tenants WHERE phone_number_id = ?`
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE phone_number_id = ?`
 	var t Tenant
-	err := db.Reader.QueryRow(query, phoneID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused)
+	err := db.Reader.QueryRow(query, phoneID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// GetTenantByWabaID retrieves a tenant by their Meta WABA ID.
+func (db *DB) GetTenantByWabaID(wabaID string) (*Tenant, error) {
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE waba_id = ?`
+	var t Tenant
+	err := db.Reader.QueryRow(query, wabaID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -287,4 +314,62 @@ func (db *DB) UpsertActiveSession(tenantID, recipientPhone string) error {
 		DO UPDATE SET expires_at = datetime('now', '+24 hours')`
 	_, err := db.Writer.Exec(query, tenantID, recipientPhone)
 	return err
+}
+
+// EnqueueClientWebhook adds a payload to the client egress queue.
+func (db *DB) EnqueueClientWebhook(tenantID string, payload string) error {
+	id := ulid.Make().String()
+	query := `INSERT INTO client_webhook_queue (id, tenant_id, payload) VALUES (?, ?, ?)`
+	_, err := db.Writer.Exec(query, id, tenantID, payload)
+	return err
+}
+
+// ClaimClientWebhook grabs the oldest queued webhook job and joins tenant info.
+func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
+	query := `
+		UPDATE client_webhook_queue 
+		SET status = 'processing', next_retry_at = datetime('now', '+1 minute')
+		WHERE id = (
+			SELECT q.id 
+			FROM client_webhook_queue q
+			WHERE q.status = 'queued' AND q.next_retry_at <= CURRENT_TIMESTAMP
+			ORDER BY q.created_at ASC
+			LIMIT 1
+		)
+		RETURNING id, tenant_id, payload, status, retry_count, next_retry_at, created_at`
+
+	var q ClientWebhookJob
+	err := db.Writer.QueryRow(query).Scan(
+		&q.ID, &q.TenantID, &q.Payload, &q.Status, &q.RetryCount, &q.NextRetryAt, &q.CreatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Join tenant info manually for simplicity or use a CTE in the RETURNING (though RETURNING join is tricky in SQLite)
+	tenant, err := db.GetTenant(q.TenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	q.WebhookURL = tenant.WebhookURL.String
+	q.WebhookSecret = tenant.WebhookSecret.String
+
+	return &q, nil
+}
+
+// MarkClientWebhookFailed updates retry count and next retry time.
+func (db *DB) MarkClientWebhookFailed(id string, retryCount int, nextRetry time.Time) {
+	query := `UPDATE client_webhook_queue SET status = 'queued', retry_count = ?, next_retry_at = ? WHERE id = ?`
+	_, _ = db.Writer.Exec(query, retryCount, nextRetry, id)
+}
+
+// MarkClientWebhookSuccess marks the job as completed.
+func (db *DB) MarkClientWebhookSuccess(id string) {
+	query := `UPDATE client_webhook_queue SET status = 'completed' WHERE id = ?`
+	_, _ = db.Writer.Exec(query, id)
 }

@@ -114,6 +114,11 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 					matched, _ := database.UpdateJobMonotonic(status.ID, status.Status, level)
 					if matched {
 						event.IsMatched = true
+						// Enqueue for client egress
+						tenant, err := database.GetTenantByWabaID(entry.ID)
+						if err == nil && tenant != nil {
+							_ = database.EnqueueClientWebhook(tenant.ID, string(body))
+						}
 					}
 
 					_ = database.InsertWebhookEvent(event)
