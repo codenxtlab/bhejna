@@ -94,7 +94,7 @@ func (e *MetaAPIError) Error() string {
 }
 
 func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumberID string) (string, error) {
-	url := fmt.Sprintf("https://graph.facebook.com/v19.0/%s/messages", phoneNumberID)
+	url := fmt.Sprintf("https://graph.facebook.com/v25.0/%s/messages", phoneNumberID)
 
 	req, err := http.NewRequest("POST", url, strings.NewReader(job.MessagePayload))
 	if err != nil {

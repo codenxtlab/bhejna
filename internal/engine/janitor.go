@@ -75,7 +75,7 @@ func staleDetector(database *db.DB) {
 	}
 }
 
-func parseWebhookDummy(payload string) (string, string, int) {
+func parseWebhookDummy(_ string) (string, string, int) {
 	// Placeholder for real webhook parsing logic
 	return "", "", 0
 }
