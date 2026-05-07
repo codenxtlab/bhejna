@@ -1,0 +1,3 @@
+api.bhejna.codenxtlab.tech {
+    reverse_proxy bhejna-api:8080
+}
