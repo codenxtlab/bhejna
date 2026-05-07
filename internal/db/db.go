@@ -2,8 +2,14 @@ package db
 
 import (
 	"database/sql"
+	_ "embed"
+	"fmt"
+
 	_ "github.com/mattn/go-sqlite3"
 )
+
+//go:embed schema.sql
+var schemaSQL string
 
 // DB encapsulates a split-connection pool for SQLite.
 // SQLite in WAL mode allows multiple readers but only ONE concurrent writer.
@@ -25,6 +31,11 @@ func InitDB(dbPath string) (*DB, error) {
 	}
 	// WRITER: Set to 1 to prevent "database is locked" errors by serializing all writes.
 	writer.SetMaxOpenConns(1)
+
+	_, err = writer.Exec(schemaSQL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute schema: %w", err)
+	}
 
 	reader, err := sql.Open("sqlite3", dsn)
 	if err != nil {
