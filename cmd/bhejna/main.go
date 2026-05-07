@@ -70,12 +70,9 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Group 1: Webhook routes
-	r.Group(func(r chi.Router) {
-		r.Use(api.MetaSignatureMiddleware(metaAppSecret))
-		r.Get("/webhook", api.HandleWebhookValidation(metaVerifyToken))
-		r.Post("/webhook", api.HandleWebhookEvent(database))
-	})
+	// Webhook routes
+	r.Get("/webhook", api.HandleWebhookValidation(metaVerifyToken))
+	r.With(api.MetaSignatureMiddleware(metaAppSecret)).Post("/webhook", api.HandleWebhookEvent(database))
 
 	// Group 2: Client routes
 	r.Group(func(r chi.Router) {

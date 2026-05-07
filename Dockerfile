@@ -1,5 +1,5 @@
 # Stage 1 (Builder)
-FROM golang:1.21-bookworm AS builder
+FROM golang:1.25-bookworm AS builder
 
 RUN apt-get update && apt-get install -y gcc libsqlite3-dev
 
