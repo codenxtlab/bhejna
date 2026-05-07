@@ -35,7 +35,10 @@ func main() {
 	metaVerifyToken := getEnv("META_VERIFY_TOKEN", "verify_me")
 	workerCount := 5 // Default worker count
 	supabaseURL := os.Getenv("SUPABASE_URL")
-	supabaseAnonKey := os.Getenv("SUPABASE_ANON_KEY")
+	supabaseKey := os.Getenv("SUPABASE_PUBLISHABLE_KEY")
+	if supabaseKey == "" {
+		supabaseKey = os.Getenv("SUPABASE_KEY")
+	}
 
 	// 2. Initialize Database
 	database, err := db.InitDB(dbPath)
@@ -62,7 +65,7 @@ func main() {
 
 	// 5. Start Janitors
 	go engine.StartJanitor(ctx, database)
-	go engine.StartSupabaseSync(ctx, database, supabaseURL, supabaseAnonKey)
+	go engine.StartSupabaseSync(ctx, database, supabaseURL, supabaseKey)
 	go engine.StartCleanupJanitor(ctx, database)
 
 	// 6. Set up Chi Router
