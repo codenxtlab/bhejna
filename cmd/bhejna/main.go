@@ -85,9 +85,12 @@ func main() {
 	})
 
 	// Group 3: Internal routes
+	// Note: HandleSyncTenant is outside the strict InternalJWTMiddleware group 
+	// because it now handles its own auth (checking both Header and Body).
+	r.Post("/v1/internal/tenant", api.HandleSyncTenant(database, internalSecret))
+	
 	r.Group(func(r chi.Router) {
 		r.Use(api.InternalJWTMiddleware(internalSecret))
-		r.Post("/v1/internal/tenant", api.HandleSyncTenant(database))
 		r.Put("/v1/internal/tenants/{id}/pause", api.HandlePauseTenant(database))
 	})
 
