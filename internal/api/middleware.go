@@ -54,6 +54,9 @@ func APIKeyMiddleware(database *db.DB) func(http.Handler) http.Handler {
 func MetaSignatureMiddleware(appSecret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Cap Meta webhook bodies at 1MB to prevent OOM from oversized payloads
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 			signature := r.Header.Get("X-Hub-Signature-256")
 			if signature == "" {
 				http.Error(w, "Unauthorized: Missing signature", http.StatusUnauthorized)

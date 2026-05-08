@@ -40,18 +40,44 @@ func (p *WorkerPool) Start(ctx context.Context) {
 
 func (p *WorkerPool) worker(ctx context.Context, id int) {
 	defer p.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("CRITICAL: Worker %d panicked: %v", id, r)
-		}
-	}()
 	log.Printf("Worker %d: started", id)
 
+	// Outer loop: restarts the inner loop if a panic occurs.
+	// The worker only exits permanently when ctx is cancelled.
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("Worker %d: stopping", id)
 			return
+		default:
+		}
+
+		exited := p.workerLoop(ctx, id)
+		if exited {
+			// Context was cancelled inside the loop, exit cleanly.
+			return
+		}
+		// If we reach here, the inner loop panicked and recovered.
+		// Brief backoff before restarting to avoid tight panic loops.
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// workerLoop runs the main processing loop. Returns true if ctx was cancelled,
+// false if it exited due to a recovered panic.
+func (p *WorkerPool) workerLoop(ctx context.Context, id int) (exited bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("CRITICAL: Worker %d panicked and will restart: %v", id, r)
+			exited = false
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %d: stopping", id)
+			return true
 		default:
 			// 1. Claim next job
 			job, err := p.db.ClaimNextJob()
@@ -70,6 +96,11 @@ func (p *WorkerPool) worker(ctx context.Context, id int) {
 			if err != nil {
 				log.Printf("Worker %d: error fetching tenant %s: %v", id, job.TenantID, err)
 				p.db.RequeueWithJitter(job.ID)
+				continue
+			}
+			if tenant == nil {
+				log.Printf("Worker %d: tenant %s not found, failing job %s", id, job.TenantID, job.ID)
+				p.db.MarkJobFailed(job.ID, "TENANT_NOT_FOUND", "tenant was deleted")
 				continue
 			}
 
@@ -109,10 +140,22 @@ func (p *WorkerPool) worker(ctx context.Context, id int) {
 				continue
 			}
 
-			// 6. On success: Update job with wamid and set status to accepted (Level 2)
-			// We first bind the wamid to the internal job ID
-			_ = p.db.SetJobMetaID(job.ID, wamid)
-			p.db.UpdateJobMonotonic(wamid, "accepted", 2)
+			// 6. On success: Bind the wamid to the internal job ID.
+			// This is CRITICAL — if SetJobMetaID fails, delivery status webhooks
+			// from Meta will never match this job, creating an orphaned record.
+			if err := p.db.SetJobMetaID(job.ID, wamid); err != nil {
+				log.Printf("Worker %d: CRITICAL: failed to bind wamid %s to job %s: %v", id, wamid, job.ID, err)
+				// Fallback: mark accepted by job ID directly so it doesn't stay stuck in "processing"
+				if err := p.db.UpdateJobStatus(job.ID, "accepted", 2); err != nil {
+					log.Printf("Worker %d: ERROR: fallback UpdateJobStatus also failed for job %s: %v", id, job.ID, err)
+				}
+				continue
+			}
+
+			// Monotonic update to "accepted" (Level 2) by wamid
+			if _, err := p.db.UpdateJobMonotonic(wamid, "accepted", 2); err != nil {
+				log.Printf("Worker %d: error updating job %s to accepted: %v", id, job.ID, err)
+			}
 		}
 	}
 }

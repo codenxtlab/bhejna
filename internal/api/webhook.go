@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/codenxtlab/bhejna/internal/db"
@@ -13,7 +14,7 @@ var statusLevels = map[string]int{
 	"sent":      3,
 	"delivered": 4,
 	"read":      5,
-	"failed":    0,
+	"failed":    3,
 }
 
 // WebhookPayload represents the root JSON sent by Meta.
@@ -111,17 +112,24 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 						IsMatched:      false,
 					}
 
-					matched, _ := database.UpdateJobMonotonic(status.ID, status.Status, level)
+					matched, err := database.UpdateJobMonotonic(status.ID, status.Status, level)
+					if err != nil {
+						log.Printf("[Webhook] ERROR: UpdateJobMonotonic failed for wamid %s: %v", status.ID, err)
+					}
 					if matched {
 						event.IsMatched = true
 						// Enqueue for client egress
 						tenant, err := database.GetTenantByWabaID(entry.ID)
 						if err == nil && tenant != nil {
-							_ = database.EnqueueClientWebhook(tenant.ID, string(body))
+							if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
+								log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for tenant %s: %v", tenant.ID, err)
+							}
 						}
 					}
 
-					_ = database.InsertWebhookEvent(event)
+					if err := database.InsertWebhookEvent(event); err != nil {
+						log.Printf("[Webhook] ERROR: InsertWebhookEvent failed: %v", err)
+					}
 				}
 
 				// 2. Check for Inbound Messages (User replied)
@@ -130,7 +138,9 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 					if phoneID != "" {
 						tenant, err := database.GetTenantByPhoneNumberID(phoneID)
 						if err == nil && tenant != nil {
-							_ = database.UpsertActiveSession(tenant.ID, msg.From)
+							if err := database.UpsertActiveSession(tenant.ID, msg.From); err != nil {
+								log.Printf("[Webhook] ERROR: UpsertActiveSession failed for tenant %s: %v", tenant.ID, err)
+							}
 						}
 					}
 				}

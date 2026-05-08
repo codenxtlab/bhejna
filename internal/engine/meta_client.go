@@ -138,8 +138,9 @@ func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumber
 		return "", fmt.Errorf("failed to marshal meta envelope: %w", err)
 	}
 
-	// LOG: Meta Request
-	log.Printf("Worker sending to Meta: %s | Payload: %s", url, string(envelopeBytes))
+	// LOG: Meta Request (metadata only — no PII)
+	log.Printf("Worker sending to Meta: phoneID=%s | type=%s | jobID=%s | size=%d bytes",
+		phoneNumberID, job.MessageType, job.ID, len(envelopeBytes))
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(envelopeBytes))
 	if err != nil {

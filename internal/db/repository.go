@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"math/rand"
 	"strings"
 	"time"
@@ -66,7 +67,7 @@ func (db *DB) UpdateJobMonotonic(metaMessageID string, newStatus string, newLeve
 func (db *DB) RequeueWithJitter(jobID string) error {
 	// 3s base + [0, 2]s random jitter
 	jitter := time.Duration(3+rand.Intn(3)) * time.Second
-	nextRetry := time.Now().Add(jitter)
+	nextRetry := time.Now().UTC().Add(jitter)
 
 	query := `
 		UPDATE jobs 
@@ -83,7 +84,13 @@ func (db *DB) GetTenant(id string) (*Tenant, error) {
 	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE id = ?`
 	var t Tenant
 	err := db.Reader.QueryRow(query, id).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
-	return &t, err
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 // PauseTenant disables a tenant for policy violations.
@@ -105,6 +112,7 @@ func (db *DB) MarkJobFailed(id string, errorCode string, errorMessage string) er
 	query := `
 		UPDATE jobs 
 		SET status = 'failed', 
+		    status_level = 6,
 		    meta_error_code = ?, 
 		    meta_error_message = ?, 
 		    updated_at = CURRENT_TIMESTAMP 
@@ -137,7 +145,7 @@ func (db *DB) GetUnmatchedEvents() ([]WebhookEvent, error) {
 		}
 		events = append(events, e)
 	}
-	return events, nil
+	return events, rows.Err()
 }
 
 // MarkEventMatched marks a webhook event as processed.
@@ -149,7 +157,7 @@ func (db *DB) MarkEventMatched(id string) error {
 
 // GetStaleJobs finds jobs stuck in 'accepted' status for too long.
 func (db *DB) GetStaleJobs(threshold time.Duration) ([]Job, error) {
-	cutoff := time.Now().Add(-threshold)
+	cutoff := time.Now().UTC().Add(-threshold)
 	query := `SELECT id, tenant_id, updated_at FROM jobs WHERE status = 'accepted' AND updated_at < ?`
 	rows, err := db.Reader.Query(query, cutoff)
 	if err != nil {
@@ -165,7 +173,7 @@ func (db *DB) GetStaleJobs(threshold time.Duration) ([]Job, error) {
 		}
 		jobs = append(jobs, j)
 	}
-	return jobs, nil
+	return jobs, rows.Err()
 }
 
 // GetTenantByAccessToken retrieves a tenant by their API key.
@@ -249,6 +257,21 @@ func (db *DB) UpsertTenantByPhone(t *Tenant) error {
 	return err
 }
 
+// CountTenantJobsInWindow returns the number of non-failed jobs for a tenant
+// created within the last 24 hours. This is the enforcement counter for
+// the tenant's messaging_limit quota.
+func (db *DB) CountTenantJobsInWindow(tenantID string) (int, error) {
+	query := `
+		SELECT COUNT(*) FROM jobs 
+		WHERE tenant_id = ? 
+		  AND created_at >= datetime('now', '-24 hours') 
+		  AND status != 'failed'`
+
+	var count int
+	err := db.Reader.QueryRow(query, tenantID).Scan(&count)
+	return count, err
+}
+
 // InsertWebhookEvent records a raw Meta event.
 func (db *DB) InsertWebhookEvent(e *WebhookEvent) error {
 	query := `INSERT INTO webhook_events (id, idempotency_key, waba_id, event_type, raw_payload, is_matched) 
@@ -279,7 +302,7 @@ func (db *DB) GetUnsyncedJobs(limit int) ([]Job, error) {
 		}
 		jobs = append(jobs, j)
 	}
-	return jobs, nil
+	return jobs, rows.Err()
 }
 
 // MarkJobsSynced updates the synced flag to 1 for the given slice of job IDs.
@@ -396,6 +419,9 @@ func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
 	if err != nil {
 		return nil, err
 	}
+	if tenant == nil {
+		return nil, fmt.Errorf("tenant %s not found for webhook job %s", q.TenantID, q.ID)
+	}
 
 	q.WebhookURL = tenant.WebhookURL.String
 	q.WebhookSecret = tenant.WebhookSecret.String
@@ -404,13 +430,15 @@ func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
 }
 
 // MarkClientWebhookFailed updates retry count and next retry time.
-func (db *DB) MarkClientWebhookFailed(id string, retryCount int, nextRetry time.Time) {
+func (db *DB) MarkClientWebhookFailed(id string, retryCount int, nextRetry time.Time) error {
 	query := `UPDATE client_webhook_queue SET status = 'queued', retry_count = ?, next_retry_at = ? WHERE id = ?`
-	_, _ = db.Writer.Exec(query, retryCount, nextRetry, id)
+	_, err := db.Writer.Exec(query, retryCount, nextRetry, id)
+	return err
 }
 
 // MarkClientWebhookSuccess marks the job as completed.
-func (db *DB) MarkClientWebhookSuccess(id string) {
+func (db *DB) MarkClientWebhookSuccess(id string) error {
 	query := `UPDATE client_webhook_queue SET status = 'completed' WHERE id = ?`
-	_, _ = db.Writer.Exec(query, id)
+	_, err := db.Writer.Exec(query, id)
+	return err
 }

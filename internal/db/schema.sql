@@ -81,3 +81,6 @@ WHERE meta_message_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_webhooks_unmatched ON webhook_events(created_at) 
 WHERE is_matched = 0;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_window ON jobs(tenant_id, created_at) 
+WHERE status != 'failed';

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -70,14 +71,30 @@ func main() {
 	webhookPool := engine.NewClientWebhookPool(database)
 	webhookPool.Start(ctx, 10)
 
-	// 5. Start Janitors
-	go engine.StartJanitor(ctx, database)
+	// 5. Start Janitors — tracked by a WaitGroup so shutdown waits for them
+	var bgWg sync.WaitGroup
+
+	bgWg.Add(1)
+	go func() {
+		defer bgWg.Done()
+		engine.StartJanitor(ctx, database)
+	}()
+
 	if supabaseServiceKey != "" {
-		go engine.StartSupabaseSync(ctx, database, supabaseURL, supabaseServiceKey)
+		bgWg.Add(1)
+		go func() {
+			defer bgWg.Done()
+			engine.StartSupabaseSync(ctx, database, supabaseURL, supabaseServiceKey)
+		}()
 	} else {
 		log.Println("Error: SUPABASE_SERVICE_ROLE_KEY is missing. Supabase sync engine is disabled.")
 	}
-	go engine.StartCleanupJanitor(ctx, database)
+
+	bgWg.Add(1)
+	go func() {
+		defer bgWg.Done()
+		engine.StartCleanupJanitor(ctx, database)
+	}()
 
 	// 6. Set up Chi Router
 	r := chi.NewRouter()
@@ -124,10 +141,10 @@ func main() {
 	<-stop
 	log.Println("Shutting down gracefully...")
 
-	// Cancel background context
+	// Cancel background context — signals all workers and janitors to stop
 	cancel()
 
-	// Shutdown HTTP server
+	// Shutdown HTTP server — stops accepting new connections, waits for in-flight
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
@@ -135,8 +152,13 @@ func main() {
 		log.Printf("HTTP server Shutdown: %v", err)
 	}
 
+	// Wait for all worker pools to drain their in-flight jobs
 	log.Println("Server stopped. Waiting for workers to finish...")
 	pool.Stop()
+	log.Println("Message workers stopped. Waiting for webhook workers...")
+	webhookPool.Stop()
+	log.Println("Webhook workers stopped. Waiting for background janitors...")
+	bgWg.Wait()
 	log.Println("Bhejna shutdown complete.")
 }
 

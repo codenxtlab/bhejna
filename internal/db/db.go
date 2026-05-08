@@ -72,10 +72,21 @@ func applyMigrations(db *sql.DB) error {
 			return err
 		}
 	}
+
+	// 2. Add quota enforcement index if it doesn't exist
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_tenant_window ON jobs(tenant_id, created_at) WHERE status != 'failed'`)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (db *DB) Close() error {
-	db.Writer.Close()
-	return db.Reader.Close()
+	errW := db.Writer.Close()
+	errR := db.Reader.Close()
+	if errW != nil {
+		return fmt.Errorf("writer close: %w", errW)
+	}
+	return errR
 }

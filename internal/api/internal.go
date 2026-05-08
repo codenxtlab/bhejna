@@ -13,6 +13,9 @@ import (
 // HandleSyncTenant processes a provisioning request from SvelteKit or a Supabase Webhook.
 func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Cap internal payloads at 1MB to prevent OOM from oversized bodies
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 		// Read the body once so we can try multiple unmarshal strategies
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
