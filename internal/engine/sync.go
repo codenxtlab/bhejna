@@ -24,9 +24,9 @@ type SupabaseJob struct {
 }
 
 // StartSupabaseSync starts the worker that syncs terminal job states to Supabase.
-func StartSupabaseSync(ctx context.Context, database *db.DB, supabaseURL, supabaseAnonKey string) {
-	if supabaseURL == "" || supabaseAnonKey == "" {
-		log.Println("Supabase sync disabled: missing URL or Key")
+func StartSupabaseSync(ctx context.Context, database *db.DB, supabaseURL, supabaseServiceKey string) {
+	if supabaseURL == "" || supabaseServiceKey == "" {
+		log.Println("Supabase sync disabled: missing URL or Service Role Key")
 		return
 	}
 
@@ -45,7 +45,7 @@ func StartSupabaseSync(ctx context.Context, database *db.DB, supabaseURL, supaba
 			log.Println("Supabase Sync Worker stopping...")
 			return
 		case <-ticker.C:
-			if err := syncJobs(database, client, supabaseURL, supabaseAnonKey); err != nil {
+			if err := syncJobs(database, client, supabaseURL, supabaseServiceKey); err != nil {
 				log.Printf("Supabase Sync Error: %v", err)
 			}
 		}
