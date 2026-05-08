@@ -9,7 +9,7 @@ type Tenant struct {
 	ID             string         `db:"id" json:"id"`
 	WabaID         string         `db:"waba_id" json:"waba_id"`
 	PhoneNumberID  string         `db:"phone_number_id" json:"phone_number_id"`
-	AccessToken    string         `db:"access_token" json:"access_token"`
+	AccessToken    string         `db:"access_token" json:"api_key"`
 	MessagingLimit int            `db:"messaging_limit" json:"messaging_limit"`
 	QualityRating  string         `db:"quality_rating" json:"quality_rating"`
 	IsPaused       bool           `db:"is_paused" json:"is_paused"`
