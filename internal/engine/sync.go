@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/codenxtlab/bhejna/internal/db"
@@ -19,8 +20,7 @@ type SupabaseJob struct {
 	RecipientPhone string `json:"recipient_phone"`
 	MessageType    string `json:"message_type"`
 	Status         string `json:"status"`
-	MetaErrorCode  string `json:"meta_error_code"`
-	MetaErrorMessage string `json:"meta_error_message"`
+	MetaErrorCode  int    `json:"meta_error_code"`
 	CreatedAt      string `json:"created_at"`
 }
 
@@ -78,10 +78,8 @@ func syncJobs(database *db.DB, client *http.Client, url, key string) error {
 			CreatedAt:      j.CreatedAt.Format(time.RFC3339),
 		}
 		if j.MetaErrorCode.Valid {
-			sj.MetaErrorCode = j.MetaErrorCode.String
-		}
-		if j.MetaErrorMessage.Valid {
-			sj.MetaErrorMessage = j.MetaErrorMessage.String
+			code, _ := strconv.Atoi(j.MetaErrorCode.String)
+			sj.MetaErrorCode = code
 		}
 		payload = append(payload, sj)
 		jobIDs = append(jobIDs, j.ID)

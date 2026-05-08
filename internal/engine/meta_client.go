@@ -116,7 +116,17 @@ func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumber
 		"messaging_product": "whatsapp",
 		"to":                job.RecipientPhone,
 		"type":              job.MessageType,
-		job.MessageType:     innerPayload,
+	}
+
+	// Fix double-nesting: if innerPayload already has the type as a key, unwrap it
+	if m, ok := innerPayload.(map[string]interface{}); ok {
+		if content, exists := m[job.MessageType]; exists {
+			envelope[job.MessageType] = content
+		} else {
+			envelope[job.MessageType] = innerPayload
+		}
+	} else {
+		envelope[job.MessageType] = innerPayload
 	}
 
 	envelopeBytes, err := json.Marshal(envelope)
