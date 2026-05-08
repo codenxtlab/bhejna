@@ -1,12 +1,13 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"strings"
+	"os"
 
 	"github.com/codenxtlab/bhejna/internal/db"
 )
@@ -96,12 +97,37 @@ func (e *MetaAPIError) Error() string {
 }
 
 func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumberID string) (string, error) {
+	// 1. Token Source: Use Global System Token if available
+	systemToken := os.Getenv("META_SYSTEM_USER_TOKEN")
+	if systemToken != "" {
+		accessToken = systemToken
+	}
+
 	url := fmt.Sprintf("https://graph.facebook.com/v25.0/%s/messages", phoneNumberID)
 
-	// LOG: Meta Request
-	log.Printf("Worker sending to Meta: %s | Payload: %s", url, job.MessagePayload)
+	// 2. Reconstruct Meta Envelope
+	// job.MessagePayload is the inner content (e.g. the template object)
+	var innerPayload interface{}
+	if err := json.Unmarshal([]byte(job.MessagePayload), &innerPayload); err != nil {
+		return "", fmt.Errorf("failed to parse internal payload: %w", err)
+	}
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(job.MessagePayload))
+	envelope := map[string]interface{}{
+		"messaging_product": "whatsapp",
+		"to":                job.RecipientPhone,
+		"type":              job.MessageType,
+		job.MessageType:     innerPayload,
+	}
+
+	envelopeBytes, err := json.Marshal(envelope)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal meta envelope: %w", err)
+	}
+
+	// LOG: Meta Request
+	log.Printf("Worker sending to Meta: %s | Payload: %s", url, string(envelopeBytes))
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(envelopeBytes))
 	if err != nil {
 		return "", err
 	}
