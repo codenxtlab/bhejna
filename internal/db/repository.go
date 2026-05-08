@@ -221,6 +221,34 @@ func (db *DB) InsertTenant(t *Tenant) error {
 	return err
 }
 
+// UpsertTenantByPhone provisions or syncs a tenant based on phone number id.
+func (db *DB) UpsertTenantByPhone(t *Tenant) error {
+	query := `
+		INSERT INTO tenants (
+			id, waba_id, phone_number_id, access_token, 
+			messaging_limit, quality_rating, is_paused,
+			webhook_url, webhook_secret
+		) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(phone_number_id) DO UPDATE SET 
+			id = excluded.id,
+			waba_id = excluded.waba_id,
+			access_token = excluded.access_token,
+			messaging_limit = excluded.messaging_limit,
+			quality_rating = excluded.quality_rating,
+			is_paused = excluded.is_paused,
+			webhook_url = COALESCE(excluded.webhook_url, tenants.webhook_url),
+			webhook_secret = COALESCE(excluded.webhook_secret, tenants.webhook_secret),
+			updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := db.Writer.Exec(query, 
+		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken, 
+		t.MessagingLimit, t.QualityRating, t.IsPaused,
+		t.WebhookURL, t.WebhookSecret,
+	)
+	return err
+}
+
 // InsertWebhookEvent records a raw Meta event.
 func (db *DB) InsertWebhookEvent(e *WebhookEvent) error {
 	query := `INSERT INTO webhook_events (id, idempotency_key, waba_id, event_type, raw_payload, is_matched) 

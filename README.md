@@ -28,7 +28,7 @@ Create a `.env` file in the root directory with the following variables:
 | `SUPABASE_URL` | Your Supabase project URL | `https://xyz.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase Service Role Key (Required for sync) | `eyJhbGci...` |
 | `META_APP_SECRET` | Meta App Secret (for webhook verification) | `abcdef123...` |
-| `META_VERIFY_TOKEN` | Meta Webhook Verify Token | `bhejna_verify_2026` |
+| `META_VERIFY_TOKEN` | Meta Webhook Verify Token | `your_secure_verify_token` |
 | `META_SYSTEM_USER_TOKEN` | Global Meta System User Token (Optional fallback) | `EAAWq...` |
 
 ## Internal Routing

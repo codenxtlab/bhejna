@@ -119,3 +119,40 @@ func syncJobs(database *db.DB, client *http.Client, url, key string) error {
 
 	return nil
 }
+
+// HydrateTenantsFromSupabase fetches all tenants from Supabase and upserts them locally.
+func HydrateTenantsFromSupabase(database *db.DB, url, key string) error {
+	reqURL := fmt.Sprintf("%s/rest/v1/tenants?select=*", url)
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create hydration request: %w", err)
+	}
+
+	req.Header.Set("apikey", key)
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute hydration request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("supabase returned non-200 status during hydration: %d", resp.StatusCode)
+	}
+
+	var tenants []db.Tenant
+	if err := json.NewDecoder(resp.Body).Decode(&tenants); err != nil {
+		return fmt.Errorf("failed to decode hydration response: %w", err)
+	}
+
+	for _, t := range tenants {
+		if err := database.UpsertTenantByPhone(&t); err != nil {
+			return fmt.Errorf("failed to upsert tenant %s during hydration: %w", t.PhoneNumberID, err)
+		}
+	}
+
+	log.Printf("Boot-Time Hydration complete: successfully synced %d tenants from Supabase", len(tenants))
+	return nil
+}

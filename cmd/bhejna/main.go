@@ -44,6 +44,16 @@ func main() {
 	}
 	defer database.Close()
 
+	// 2.5 Boot-Time Hydration
+	if supabaseServiceKey != "" && supabaseURL != "" {
+		log.Println("Starting Boot-Time Hydration from Supabase...")
+		if err := engine.HydrateTenantsFromSupabase(database, supabaseURL, supabaseServiceKey); err != nil {
+			log.Fatalf("Fatal: Boot-Time Hydration failed: %v", err)
+		}
+	} else {
+		log.Println("Warning: SUPABASE_SERVICE_ROLE_KEY or SUPABASE_URL missing, skipping boot-time hydration.")
+	}
+
 	// 3. Initialize Engine Components
 	limiters := engine.NewLimiterManager()
 	metaClient := engine.NewMetaAPIClient()
