@@ -138,8 +138,14 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 					if phoneID != "" {
 						tenant, err := database.GetTenantByPhoneNumberID(phoneID)
 						if err == nil && tenant != nil {
+							// Open the 24-hour free messaging window
 							if err := database.UpsertActiveSession(tenant.ID, msg.From); err != nil {
 								log.Printf("[Webhook] ERROR: UpsertActiveSession failed for tenant %s: %v", tenant.ID, err)
+							}
+
+							// Forward the inbound message to the client's webhook
+							if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
+								log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for inbound message, tenant %s: %v", tenant.ID, err)
 							}
 						}
 					}
