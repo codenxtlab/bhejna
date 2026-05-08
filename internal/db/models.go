@@ -31,6 +31,7 @@ type Job struct {
 	StatusLevel    int            `db:"status_level"`
 	MetaMessageID  sql.NullString `db:"meta_message_id"`
 	MetaErrorCode  sql.NullString `db:"meta_error_code"`
+	MetaErrorMessage sql.NullString `db:"meta_error_message"`
 	RetryCount     int            `db:"retry_count"`
 	NextRetryAt    time.Time      `db:"next_retry_at"`
 	Synced         bool           `db:"synced"`

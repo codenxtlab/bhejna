@@ -28,13 +28,13 @@ func (db *DB) ClaimNextJob() (*Job, error) {
 			LIMIT 1
 		)
 		RETURNING id, tenant_id, recipient_phone, message_type, message_payload, 
-		          status, status_level, meta_message_id, meta_error_code, 
+		          status, status_level, meta_message_id, meta_error_code, meta_error_message, 
 		          retry_count, next_retry_at, synced, created_at, updated_at`
 
 	var j Job
 	err := db.Writer.QueryRow(query).Scan(
 		&j.ID, &j.TenantID, &j.RecipientPhone, &j.MessageType, &j.MessagePayload,
-		&j.Status, &j.StatusLevel, &j.MetaMessageID, &j.MetaErrorCode,
+		&j.Status, &j.StatusLevel, &j.MetaMessageID, &j.MetaErrorCode, &j.MetaErrorMessage,
 		&j.RetryCount, &j.NextRetryAt, &j.Synced, &j.CreatedAt, &j.UpdatedAt,
 	)
 
@@ -97,6 +97,19 @@ func (db *DB) PauseTenant(id string, reason string) error {
 func (db *DB) UpdateJobStatus(id string, status string, level int) error {
 	query := `UPDATE jobs SET status = ?, status_level = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
 	_, err := db.Writer.Exec(query, status, level, id)
+	return err
+}
+
+// MarkJobFailed records the failure reason and updates status.
+func (db *DB) MarkJobFailed(id string, errorCode string, errorMessage string) error {
+	query := `
+		UPDATE jobs 
+		SET status = 'failed', 
+		    meta_error_code = ?, 
+		    meta_error_message = ?, 
+		    updated_at = CURRENT_TIMESTAMP 
+		WHERE id = ?`
+	_, err := db.Writer.Exec(query, errorCode, errorMessage, id)
 	return err
 }
 
@@ -168,9 +181,9 @@ func (db *DB) GetTenantByAccessToken(token string) (*Tenant, error) {
 
 // InsertJob enqueues a new message job.
 func (db *DB) InsertJob(j *Job) error {
-	query := `INSERT INTO jobs (id, tenant_id, recipient_phone, message_type, message_payload, status, status_level, next_retry_at, idempotency_key) 
-	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := db.Writer.Exec(query, j.ID, j.TenantID, j.RecipientPhone, j.MessageType, j.MessagePayload, j.Status, j.StatusLevel, j.NextRetryAt, j.IdempotencyKey)
+	query := `INSERT INTO jobs (id, tenant_id, recipient_phone, message_type, message_payload, status, status_level, next_retry_at, idempotency_key, meta_error_code, meta_error_message) 
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := db.Writer.Exec(query, j.ID, j.TenantID, j.RecipientPhone, j.MessageType, j.MessagePayload, j.Status, j.StatusLevel, j.NextRetryAt, j.IdempotencyKey, j.MetaErrorCode, j.MetaErrorMessage)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") && strings.Contains(err.Error(), "idempotency_key") {
 			return ErrIdempotencyConflict
@@ -218,7 +231,7 @@ func (db *DB) InsertWebhookEvent(e *WebhookEvent) error {
 // GetUnsyncedJobs selects up to limit jobs that are in a terminal state and haven't been synced.
 func (db *DB) GetUnsyncedJobs(limit int) ([]Job, error) {
 	query := `
-		SELECT id, tenant_id, recipient_phone, message_type, status, meta_error_code, created_at 
+		SELECT id, tenant_id, recipient_phone, message_type, status, meta_error_code, meta_error_message, created_at 
 		FROM jobs 
 		WHERE synced = 0 
 		  AND status IN ('delivered', 'read', 'failed')
@@ -233,7 +246,7 @@ func (db *DB) GetUnsyncedJobs(limit int) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var j Job
-		if err := rows.Scan(&j.ID, &j.TenantID, &j.RecipientPhone, &j.MessageType, &j.Status, &j.MetaErrorCode, &j.CreatedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.TenantID, &j.RecipientPhone, &j.MessageType, &j.Status, &j.MetaErrorCode, &j.MetaErrorMessage, &j.CreatedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -87,6 +88,7 @@ type MetaAPIError struct {
 	StatusCode int
 	Code       int
 	Message    string
+	RawBody    string
 }
 
 func (e *MetaAPIError) Error() string {
@@ -95,6 +97,9 @@ func (e *MetaAPIError) Error() string {
 
 func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumberID string) (string, error) {
 	url := fmt.Sprintf("https://graph.facebook.com/v25.0/%s/messages", phoneNumberID)
+
+	// LOG: Meta Request
+	log.Printf("Worker sending to Meta: %s | Payload: %s", url, job.MessagePayload)
 
 	req, err := http.NewRequest("POST", url, strings.NewReader(job.MessagePayload))
 	if err != nil {
@@ -113,14 +118,22 @@ func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumber
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 400 {
+		// LOG: Meta Error Body
+		log.Printf("Meta API Error (%d): %s", resp.StatusCode, string(body))
+
 		var errResp MetaErrorResponse
 		if err := json.Unmarshal(body, &errResp); err != nil {
-			return "", fmt.Errorf("meta api error (status %d): %s", resp.StatusCode, string(body))
+			return "", &MetaAPIError{
+				StatusCode: resp.StatusCode,
+				Message:    fmt.Sprintf("unknown error: %s", string(body)),
+				RawBody:    string(body),
+			}
 		}
 		return "", &MetaAPIError{
 			StatusCode: resp.StatusCode,
 			Code:       errResp.Error.Code,
 			Message:    errResp.Error.Message,
+			RawBody:    string(body),
 		}
 	}
 

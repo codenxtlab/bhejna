@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status_level INTEGER DEFAULT 0,
     meta_message_id TEXT,
     meta_error_code TEXT,
+    meta_error_message TEXT,
     retry_count INTEGER DEFAULT 0,
     next_retry_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     synced BOOLEAN DEFAULT 0,

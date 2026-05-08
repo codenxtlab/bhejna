@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -76,15 +77,29 @@ func (p *WorkerPool) worker(ctx context.Context, id int) {
 			// 3. Send message
 			wamid, err := p.metaClient.SendMessage(job, tenant.AccessToken, tenant.PhoneNumberID)
 			if err != nil {
+				errorCode := "UNKNOWN"
+				errorMessage := err.Error()
+
+				if apiErr, ok := err.(*MetaAPIError); ok {
+					errorCode = fmt.Sprintf("%d", apiErr.Code)
+					errorMessage = apiErr.Message
+					if apiErr.RawBody != "" {
+						errorMessage = apiErr.RawBody
+					}
+				}
+
 				// 4. Handle transient error
 				if IsTransientError(err) {
+					log.Printf("Worker %d: transient error for job %s, requeueing: %v", id, job.ID, err)
 					p.db.RequeueWithJitter(job.ID)
 				} else if IsPolicyError(err) {
 					// 5. Handle policy error
-					p.db.UpdateJobStatus(job.ID, "failed", 0)
+					log.Printf("Worker %d: policy violation for job %s, failing job and pausing tenant %s", id, job.ID, job.TenantID)
+					p.db.MarkJobFailed(job.ID, errorCode, errorMessage)
 					p.db.PauseTenant(job.TenantID, "POLICY_VIOLATION")
 				} else {
-					p.db.UpdateJobStatus(job.ID, "failed", 0)
+					log.Printf("Worker %d: permanent failure for job %s: %v", id, job.ID, err)
+					p.db.MarkJobFailed(job.ID, errorCode, errorMessage)
 				}
 				continue
 			}

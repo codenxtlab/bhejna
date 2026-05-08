@@ -20,6 +20,7 @@ type SupabaseJob struct {
 	MessageType    string `json:"message_type"`
 	Status         string `json:"status"`
 	MetaErrorCode  string `json:"meta_error_code"`
+	MetaErrorMessage string `json:"meta_error_message"`
 	CreatedAt      string `json:"created_at"`
 }
 
@@ -78,6 +79,9 @@ func syncJobs(database *db.DB, client *http.Client, url, key string) error {
 		}
 		if j.MetaErrorCode.Valid {
 			sj.MetaErrorCode = j.MetaErrorCode.String
+		}
+		if j.MetaErrorMessage.Valid {
+			sj.MetaErrorMessage = j.MetaErrorMessage.String
 		}
 		payload = append(payload, sj)
 		jobIDs = append(jobIDs, j.ID)
