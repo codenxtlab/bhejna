@@ -40,6 +40,11 @@ func (p *WorkerPool) Start(ctx context.Context) {
 
 func (p *WorkerPool) worker(ctx context.Context, id int) {
 	defer p.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("CRITICAL: Worker %d panicked: %v", id, r)
+		}
+	}()
 	log.Printf("Worker %d: started", id)
 
 	for {

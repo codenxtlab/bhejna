@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/codenxtlab/bhejna/internal/db"
 )
@@ -18,7 +19,9 @@ type MetaAPIClient struct {
 
 func NewMetaAPIClient() *MetaAPIClient {
 	return &MetaAPIClient{
-		client: &http.Client{},
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+		},
 	}
 }
 
@@ -113,9 +116,10 @@ func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumber
 	}
 
 	envelope := map[string]interface{}{
-		"messaging_product": "whatsapp",
-		"to":                job.RecipientPhone,
-		"type":              job.MessageType,
+		"messaging_product":        "whatsapp",
+		"to":                       job.RecipientPhone,
+		"type":                     job.MessageType,
+		"biz_opaque_callback_data": job.ID,
 	}
 
 	// Fix double-nesting: if innerPayload already has the type as a key, unwrap it

@@ -31,6 +31,7 @@ func InitDB(dbPath string) (*DB, error) {
 	}
 	// WRITER: Set to 1 to prevent "database is locked" errors by serializing all writes.
 	writer.SetMaxOpenConns(1)
+	writer.SetMaxIdleConns(1)
 
 	_, err = writer.Exec(schemaSQL)
 	if err != nil {
@@ -48,6 +49,7 @@ func InitDB(dbPath string) (*DB, error) {
 	}
 	// READER: Set to 10 to allow concurrent read-heavy operations (e.g. status checks).
 	reader.SetMaxOpenConns(10)
+	reader.SetMaxIdleConns(10)
 
 	return &DB{
 		Writer: writer,

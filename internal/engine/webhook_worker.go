@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -35,6 +36,12 @@ func (p *ClientWebhookPool) Start(ctx context.Context, workerCount int) {
 }
 
 func (p *ClientWebhookPool) worker(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("CRITICAL: Webhook worker panicked: %v", r)
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -85,6 +92,7 @@ func (p *ClientWebhookPool) processJob(job *db.ClientWebhookJob) {
 		return
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		p.db.MarkClientWebhookSuccess(job.ID)
