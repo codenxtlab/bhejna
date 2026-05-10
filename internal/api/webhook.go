@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/codenxtlab/bhejna/internal/api/generated"
 	"github.com/codenxtlab/bhejna/internal/db"
 	"github.com/oklog/ulid/v2"
 )
@@ -15,48 +16,6 @@ var statusLevels = map[string]int{
 	"delivered": 4,
 	"read":      5,
 	"failed":    3,
-}
-
-// WebhookPayload represents the root JSON sent by Meta.
-type WebhookPayload struct {
-	Object string `json:"object"` // Usually "whatsapp_business_account"
-	Entry  []struct {
-		ID      string `json:"id"` // WABA ID
-		Changes []struct {
-			Field string `json:"field"` // Usually "messages"
-			Value struct {
-				MessagingProduct string `json:"messaging_product"`
-				Metadata         struct {
-					DisplayPhoneNumber string `json:"display_phone_number"`
-					PhoneNumberID      string `json:"phone_number_id"`
-				} `json:"metadata"`
-                
-				// Statuses represents delivery receipts (sent, delivered, read, failed)
-				Statuses []struct {
-					ID          string `json:"id"`     // The wamid
-					Status      string `json:"status"` 
-					Timestamp   string `json:"timestamp"`
-					RecipientID string `json:"recipient_id"`
-					Errors      []struct {
-						Code  int    `json:"code"`
-						Title string `json:"title"`
-					} `json:"errors,omitempty"`
-				} `json:"statuses,omitempty"`
-                
-				// Messages represents actual inbound text/media from the user
-				Messages []struct {
-					From      string `json:"from"`
-					ID        string `json:"id"` // Inbound wamid
-					Timestamp string `json:"timestamp"`
-					Type      string `json:"type"` // "text", "image", etc.
-					Text      struct {
-						Body string `json:"body"`
-					} `json:"text,omitempty"`
-				} `json:"messages,omitempty"`
-                
-			} `json:"value"`
-		} `json:"changes"`
-	} `json:"entry"`
 }
 
 // HandleWebhookValidation handles Meta's verification challenge.
@@ -86,7 +45,7 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 			return
 		}
 
-		var payload WebhookPayload
+		var payload generated.WebhookPayload
 		if err := json.Unmarshal(body, &payload); err != nil {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -96,56 +55,69 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 		for _, entry := range payload.Entry {
 			for _, change := range entry.Changes {
 				// 1. Check for Outbound Status Updates (Delivery Receipts)
-				for _, status := range change.Value.Statuses {
-					level, exists := statusLevels[status.Status]
-					if !exists {
-						continue
-					}
+				if change.Value.Statuses != nil {
+					for _, status := range *change.Value.Statuses {
+						if status.Status == nil || status.Id == nil {
+							continue
+						}
 
-					// Insert raw event
-					event := &db.WebhookEvent{
-						ID:             ulid.Make().String(),
-						IdempotencyKey: status.ID + ":" + status.Status,
-						WabaID:         entry.ID,
-						EventType:      status.Status,
-						RawPayload:     string(body),
-						IsMatched:      false,
-					}
+						statusStr := string(*status.Status)
+						level, exists := statusLevels[statusStr]
+						if !exists {
+							continue
+						}
 
-					matched, err := database.UpdateJobMonotonic(status.ID, status.Status, level)
-					if err != nil {
-						log.Printf("[Webhook] ERROR: UpdateJobMonotonic failed for wamid %s: %v", status.ID, err)
-					}
-					if matched {
-						event.IsMatched = true
-						// Enqueue for client egress
-						tenant, err := database.GetTenantByWabaID(entry.ID)
-						if err == nil && tenant != nil {
-							if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
-								log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for tenant %s: %v", tenant.ID, err)
+						// Insert raw event
+						event := &db.WebhookEvent{
+							ID:             ulid.Make().String(),
+							IdempotencyKey: *status.Id + ":" + statusStr,
+							WabaID:         entry.Id,
+							EventType:      statusStr,
+							RawPayload:     string(body),
+							IsMatched:      false,
+						}
+
+						matched, err := database.UpdateJobMonotonic(*status.Id, statusStr, level)
+						if err != nil {
+							log.Printf("[Webhook] ERROR: UpdateJobMonotonic failed for wamid %s: %v", *status.Id, err)
+						}
+						if matched {
+							event.IsMatched = true
+							// Enqueue for client egress
+							tenant, err := database.GetTenantByWabaID(entry.Id)
+							if err == nil && tenant != nil {
+								if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
+									log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for tenant %s: %v", tenant.ID, err)
+								}
 							}
 						}
-					}
 
-					if err := database.InsertWebhookEvent(event); err != nil {
-						log.Printf("[Webhook] ERROR: InsertWebhookEvent failed: %v", err)
+						if err := database.InsertWebhookEvent(event); err != nil {
+							log.Printf("[Webhook] ERROR: InsertWebhookEvent failed: %v", err)
+						}
 					}
 				}
 
 				// 2. Check for Inbound Messages (User replied)
-				for _, msg := range change.Value.Messages {
-					phoneID := change.Value.Metadata.PhoneNumberID
-					if phoneID != "" {
-						tenant, err := database.GetTenantByPhoneNumberID(phoneID)
-						if err == nil && tenant != nil {
-							// Open the 24-hour free messaging window
-							if err := database.UpsertActiveSession(tenant.ID, msg.From); err != nil {
-								log.Printf("[Webhook] ERROR: UpsertActiveSession failed for tenant %s: %v", tenant.ID, err)
-							}
+				if change.Value.Messages != nil {
+					for _, msg := range *change.Value.Messages {
+						if msg.From == nil || change.Value.Metadata == nil || change.Value.Metadata.PhoneNumberId == nil {
+							continue
+						}
 
-							// Forward the inbound message to the client's webhook
-							if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
-								log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for inbound message, tenant %s: %v", tenant.ID, err)
+						phoneID := *change.Value.Metadata.PhoneNumberId
+						if phoneID != "" {
+							tenant, err := database.GetTenantByPhoneNumberID(phoneID)
+							if err == nil && tenant != nil {
+								// Open the 24-hour free messaging window
+								if err := database.UpsertActiveSession(tenant.ID, *msg.From); err != nil {
+									log.Printf("[Webhook] ERROR: UpsertActiveSession failed for tenant %s: %v", tenant.ID, err)
+								}
+
+								// Forward the inbound message to the client's webhook
+								if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
+									log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for inbound message, tenant %s: %v", tenant.ID, err)
+								}
 							}
 						}
 					}

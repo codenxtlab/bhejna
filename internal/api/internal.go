@@ -1,11 +1,13 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/codenxtlab/bhejna/internal/api/generated"
 	"github.com/codenxtlab/bhejna/internal/db"
 	"github.com/go-chi/chi/v5"
 )
@@ -24,7 +26,6 @@ func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
 		}
 
 		// Check for system_token in body if not already authorized by middleware
-		// (Though middleware usually runs first, we'll check here to be sure)
 		var authCheck struct {
 			SystemToken string `json:"system_token"`
 		}
@@ -44,35 +45,45 @@ func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
 			return
 		}
 
-		// Option 1: Supabase Webhook payload format
-		var webhookPayload struct {
-			Record *db.Tenant `json:"record"`
+		var syncBody generated.SyncTenantJSONBody
+		if err := json.Unmarshal(bodyBytes, &syncBody); err != nil {
+			http.Error(w, "Bad Request: invalid payload structure", http.StatusBadRequest)
+			return
 		}
 
-		var tenant *db.Tenant
-
-		if err := json.Unmarshal(bodyBytes, &webhookPayload); err == nil && webhookPayload.Record != nil && (webhookPayload.Record.ID != "") {
-			tenant = webhookPayload.Record
+		var genTenant generated.Tenant
+		// Try AsSyncTenantJSONBody1 first (the wrapped {record: ...} format)
+		if wrapped, err := syncBody.AsSyncTenantJSONBody1(); err == nil && wrapped.Record.Id != "" {
+			genTenant = wrapped.Record
+		} else if direct, err := syncBody.AsTenant(); err == nil && direct.Id != "" {
+			genTenant = direct
 		} else {
-			// Option 2: Direct Tenant payload format (SvelteKit)
-			var directReq struct {
-				db.Tenant
-				TenantID string `json:"tenant_id"`
-			}
-			if err := json.Unmarshal(bodyBytes, &directReq); err != nil {
-				http.Error(w, "Bad Request: invalid payload", http.StatusBadRequest)
-				return
-			}
-			tenant = &directReq.Tenant
-			// Map tenant_id to ID if ID is empty
-			if tenant.ID == "" {
-				tenant.ID = directReq.TenantID
-			}
+			http.Error(w, "Bad Request: invalid tenant data", http.StatusBadRequest)
+			return
+		}
 
-			if tenant.ID == "" {
-				http.Error(w, "Bad Request: missing tenant identification", http.StatusBadRequest)
-				return
-			}
+		// Convert generated.Tenant to db.Tenant
+		tenant := &db.Tenant{
+			ID:            genTenant.Id,
+			WabaID:        genTenant.WabaId,
+			PhoneNumberID: genTenant.PhoneNumberId,
+			IsPaused:      false,
+		}
+
+		if genTenant.ApiKey != nil {
+			tenant.AccessToken = *genTenant.ApiKey
+		}
+		if genTenant.MessagingLimit != nil {
+			tenant.MessagingLimit = *genTenant.MessagingLimit
+		}
+		if genTenant.QualityRating != nil {
+			tenant.QualityRating = *genTenant.QualityRating
+		}
+		if genTenant.IsPaused != nil {
+			tenant.IsPaused = *genTenant.IsPaused
+		}
+		if genTenant.WebhookUrl != nil {
+			tenant.WebhookURL = sql.NullString{String: *genTenant.WebhookUrl, Valid: true}
 		}
 
 		// UPSERT the tenant into local SQLite
@@ -84,6 +95,8 @@ func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 	}
 }
+
+
 
 // HandlePauseTenant manually pauses a tenant.
 func HandlePauseTenant(database *db.DB) http.HandlerFunc {
@@ -102,3 +115,4 @@ func HandlePauseTenant(database *db.DB) http.HandlerFunc {
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
+

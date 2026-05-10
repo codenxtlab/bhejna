@@ -9,37 +9,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codenxtlab/bhejna/internal/api/generated"
 	"github.com/codenxtlab/bhejna/internal/db"
 	"github.com/oklog/ulid/v2"
 )
 
 // phoneRegex matches E.164-ish format: optional leading +, then 7-15 digits only.
 var phoneRegex = regexp.MustCompile(`^\+?\d{7,15}$`)
-
-// validMessageTypes is the whitelist of allowed message types for Meta's API.
-var validMessageTypes = map[string]bool{
-	"text":        true,
-	"template":    true,
-	"image":       true,
-	"document":    true,
-	"audio":       true,
-	"video":       true,
-	"sticker":     true,
-	"location":    true,
-	"contacts":    true,
-	"interactive": true,
-}
-
-type SendMessageRequest struct {
-	RecipientPhone string          `json:"recipient"`
-	MessageType    string          `json:"message_type"`
-	Payload        json.RawMessage `json:"payload"`
-}
-
-type SendMessageResponse struct {
-	JobID  string `json:"job_id"`
-	Status string `json:"status"`
-}
 
 // HandleSendMessage accepts a message request and enqueues it.
 func HandleSendMessage(database *db.DB) http.HandlerFunc {
@@ -53,7 +29,7 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 			return
 		}
 
-		var req SendMessageRequest
+		var req generated.SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Bad Request: Invalid JSON", http.StatusBadRequest)
 			return
@@ -62,24 +38,18 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 		// --- Input Sanitization ---
 
 		// 1. Strip all whitespace from phone number
-		req.RecipientPhone = strings.ReplaceAll(req.RecipientPhone, " ", "")
-		req.RecipientPhone = strings.TrimSpace(req.RecipientPhone)
+		req.Recipient = strings.ReplaceAll(req.Recipient, " ", "")
+		req.Recipient = strings.TrimSpace(req.Recipient)
 
 		// 2. Validate phone number format (E.164: optional +, 7-15 digits)
-		if !phoneRegex.MatchString(req.RecipientPhone) {
+		if !phoneRegex.MatchString(req.Recipient) {
 			http.Error(w, "Bad Request: Invalid recipient phone number format", http.StatusBadRequest)
 			return
 		}
 
-		// 3. Validate message type against whitelist
-		if !validMessageTypes[req.MessageType] {
+		// 3. Validate message type against generated enum
+		if !req.MessageType.Valid() {
 			http.Error(w, "Bad Request: Invalid message_type", http.StatusBadRequest)
-			return
-		}
-
-		// 4. Cap payload size (64KB max)
-		if len(req.Payload) > 65536 {
-			http.Error(w, "Bad Request: Payload too large", http.StatusBadRequest)
 			return
 		}
 
@@ -103,13 +73,20 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 			idempotencyPtr = &idempotencyKey
 		}
 
+		payloadBytes, _ := json.Marshal(req.Payload)
+		// 4. Cap payload size (64KB max)
+		if len(payloadBytes) > 65536 {
+			http.Error(w, "Bad Request: Payload too large", http.StatusBadRequest)
+			return
+		}
+
 		jobID := ulid.Make().String()
 		job := &db.Job{
 			ID:             jobID,
 			TenantID:       tenant.ID,
-			RecipientPhone: req.RecipientPhone,
-			MessageType:    req.MessageType,
-			MessagePayload: string(req.Payload),
+			RecipientPhone: req.Recipient,
+			MessageType:    string(req.MessageType),
+			MessagePayload: string(payloadBytes),
 			Status:         "queued",
 			StatusLevel:    0,
 			NextRetryAt:    time.Now().UTC(),
@@ -120,9 +97,9 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 			if errors.Is(err, db.ErrIdempotencyConflict) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusAccepted)
-				json.NewEncoder(w).Encode(SendMessageResponse{
-					JobID:  "existing",
-					Status: "queued",
+				json.NewEncoder(w).Encode(generated.SendMessageResponse{
+					JobId:  "existing",
+					Status: generated.Queued,
 				})
 				return
 			}
@@ -132,10 +109,12 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			JobID:  jobID,
-			Status: "queued",
+		json.NewEncoder(w).Encode(generated.SendMessageResponse{
+			JobId:  jobID,
+			Status: generated.Queued,
 		})
 	}
 }
+
+
 
