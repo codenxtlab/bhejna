@@ -7,10 +7,10 @@ info:
   version: 1.0.0
   contact:
     name: CodeNxt Lab
-    url: https://codenxtlab.com
+    url: https://codenxtlab.tech
 
 servers:
-  - url: https://api.bhejna.com
+  - url: https://api.bhejna.codenxtlab.tech
     description: Production Server
 
 tags:
