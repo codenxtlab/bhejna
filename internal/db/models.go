@@ -17,8 +17,8 @@ type Tenant struct {
 	PauseReason    sql.NullString `db:"pause_reason" json:"-"`
 	CreatedAt      time.Time      `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
-	WebhookURL     sql.NullString `db:"webhook_url" json:"webhook_url"`
-	WebhookSecret  sql.NullString `db:"webhook_secret" json:"-"`
+	WebhookURL     *string        `db:"webhook_url" json:"webhook_url"`
+	WebhookSecret  *string        `db:"webhook_secret" json:"webhook_secret"`
 }
 
 type Job struct {

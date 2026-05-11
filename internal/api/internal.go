@@ -1,7 +1,6 @@
 package api
 
 import (
-	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -82,9 +81,8 @@ func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
 		if genTenant.IsPaused != nil {
 			tenant.IsPaused = *genTenant.IsPaused
 		}
-		if genTenant.WebhookUrl != nil {
-			tenant.WebhookURL = sql.NullString{String: *genTenant.WebhookUrl, Valid: true}
-		}
+		tenant.WebhookURL = genTenant.WebhookUrl
+		tenant.WebhookSecret = genTenant.WebhookSecret
 
 		// UPSERT the tenant into local SQLite
 		if err := database.InsertTenant(tenant); err != nil {

@@ -423,8 +423,12 @@ func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
 		return nil, fmt.Errorf("tenant %s not found for webhook job %s", q.TenantID, q.ID)
 	}
 
-	q.WebhookURL = tenant.WebhookURL.String
-	q.WebhookSecret = tenant.WebhookSecret.String
+	if tenant.WebhookURL != nil {
+		q.WebhookURL = *tenant.WebhookURL
+	}
+	if tenant.WebhookSecret != nil {
+		q.WebhookSecret = *tenant.WebhookSecret
+	}
 
 	return &q, nil
 }
