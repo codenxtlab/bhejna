@@ -229,6 +229,52 @@ components:
                                     type: string
 
 paths:
+  /v1/meta/webhook:
+    get:
+      operationId: GetV1MetaWebhook
+      tags:
+        - Webhooks
+      summary: Meta Webhook Verification
+      parameters:
+        - in: query
+          name: hub.mode
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: hub.challenge
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: hub.verify_token
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+        '403':
+          description: Forbidden
+    post:
+      operationId: PostV1MetaWebhook
+      tags:
+        - Webhooks
+      summary: Meta Webhook Payload Receiver
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: OK
+
   /v1/internal/webhook-schema:
     post:
       operationId: forceGenerateWebhookType

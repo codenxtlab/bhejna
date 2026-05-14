@@ -26,17 +26,17 @@ func StartJanitor(ctx context.Context, database *db.DB) {
 		case <-ticker1.C:
 			// Ticker 1: Park & Sweep (Every 1 min)
 			// Selects unmatched webhook events and tries to reconcile them with jobs.
-			parkAndSweep(database)
+			parkAndSweep(ctx, database)
 		case <-ticker2.C:
 			// Ticker 2: Stale Detector (Every 15 mins)
 			// Alerts for jobs stuck in 'accepted' status for too long.
-			staleDetector(database)
+			staleDetector(ctx, database)
 		}
 	}
 }
 
-func parkAndSweep(database *db.DB) {
-	events, err := database.GetUnmatchedEvents()
+func parkAndSweep(ctx context.Context, database *db.DB) {
+	events, err := database.GetUnmatchedEvents(ctx)
 	if err != nil {
 		log.Printf("Janitor: error fetching unmatched events: %v", err)
 		return
@@ -50,27 +50,27 @@ func parkAndSweep(database *db.DB) {
 			continue
 		}
 
-		success, err := database.UpdateJobMonotonic(wamid, status, level)
+		success, err := database.UpdateJobMonotonic(ctx, wamid, status, level)
 		if err != nil {
 			log.Printf("Janitor: error updating job %s: %v", wamid, err)
 			continue
 		}
 
 		if success {
-			_ = database.MarkEventMatched(event.ID)
+			_ = database.MarkEventMatched(ctx, event.ID)
 		}
 	}
 }
 
-func staleDetector(database *db.DB) {
-	staleJobs, err := database.GetStaleJobs(15 * time.Minute)
+func staleDetector(ctx context.Context, database *db.DB) {
+	staleJobs, err := database.GetStaleJobs(ctx, 15 * time.Minute)
 	if err != nil {
 		log.Printf("Janitor: error checking stale jobs: %v", err)
 		return
 	}
 
 	for _, job := range staleJobs {
-		log.Printf("ALERT: Stale job detected! ID: %s, Tenant: %s, Last Update: %v", 
+		log.Printf("ALERT: Stale job detected! ID: %s, Tenant: %s, Last Update: %v",
 			job.ID, job.TenantID, job.UpdatedAt)
 	}
 }

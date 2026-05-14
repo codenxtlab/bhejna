@@ -17,7 +17,7 @@ func StartCleanupJanitor(ctx context.Context, database *db.DB) {
 	log.Println("Cleanup Janitor started (24h cycle)")
 
 	// Run once on startup to clean up immediately if needed
-	performCleanup(database)
+	performCleanup(ctx, database)
 
 	for {
 		select {
@@ -25,13 +25,13 @@ func StartCleanupJanitor(ctx context.Context, database *db.DB) {
 			log.Println("Cleanup Janitor stopping...")
 			return
 		case <-ticker.C:
-			performCleanup(database)
+			performCleanup(ctx, database)
 		}
 	}
 }
 
-func performCleanup(database *db.DB) {
-	rows, err := database.DeleteOldSyncedJobs(7)
+func performCleanup(ctx context.Context, database *db.DB) {
+	rows, err := database.DeleteOldSyncedJobs(ctx, 7)
 	if err != nil {
 		log.Printf("Cleanup Janitor Error: %v", err)
 		return

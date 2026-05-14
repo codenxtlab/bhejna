@@ -13,7 +13,7 @@ var schemaSQL string
 
 // DB encapsulates a split-connection pool for SQLite.
 // SQLite in WAL mode allows multiple readers but only ONE concurrent writer.
-// We split the pools to ensure mutations are serialized (MaxOpenConns=1) 
+// We split the pools to ensure mutations are serialized (MaxOpenConns=1)
 // while lookups remain highly concurrent.
 type DB struct {
 	Writer *sql.DB

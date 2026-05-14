@@ -80,7 +80,7 @@ func (p *WorkerPool) workerLoop(ctx context.Context, id int) (exited bool) {
 			return true
 		default:
 			// 1. Claim next job
-			job, err := p.db.ClaimNextJob()
+			job, err := p.db.ClaimNextJob(ctx)
 			if err != nil {
 				log.Printf("Worker %d: error claiming job: %v", id, err)
 				time.Sleep(100 * time.Millisecond)
@@ -92,21 +92,21 @@ func (p *WorkerPool) workerLoop(ctx context.Context, id int) (exited bool) {
 			}
 
 			// Fetch tenant for access token and phone ID
-			tenant, err := p.db.GetTenant(job.TenantID)
+			tenant, err := p.db.GetTenant(ctx, job.TenantID)
 			if err != nil {
 				log.Printf("Worker %d: error fetching tenant %s: %v", id, job.TenantID, err)
-				p.db.RequeueWithJitter(job.ID)
+				p.db.RequeueWithJitter(ctx, job.ID)
 				continue
 			}
 			if tenant == nil {
 				log.Printf("Worker %d: tenant %s not found, failing job %s", id, job.TenantID, job.ID)
-				p.db.MarkJobFailed(job.ID, "TENANT_NOT_FOUND", "tenant was deleted")
+				p.db.MarkJobFailed(ctx, job.ID, "TENANT_NOT_FOUND", "tenant was deleted")
 				continue
 			}
 
 			// 2. Check rate limit
 			if !p.limiters.Allow(tenant.ID, tenant.PhoneNumberID) {
-				p.db.RequeueWithJitter(job.ID)
+				p.db.RequeueWithJitter(ctx, job.ID)
 				continue
 			}
 
@@ -127,15 +127,15 @@ func (p *WorkerPool) workerLoop(ctx context.Context, id int) (exited bool) {
 				// 4. Handle transient error
 				if IsTransientError(err) {
 					log.Printf("Worker %d: transient error for job %s, requeueing: %v", id, job.ID, err)
-					p.db.RequeueWithJitter(job.ID)
+					p.db.RequeueWithJitter(ctx, job.ID)
 				} else if IsPolicyError(err) {
 					// 5. Handle policy error
 					log.Printf("Worker %d: policy violation for job %s, failing job and pausing tenant %s", id, job.ID, job.TenantID)
-					p.db.MarkJobFailed(job.ID, errorCode, errorMessage)
-					p.db.PauseTenant(job.TenantID, "POLICY_VIOLATION")
+					p.db.MarkJobFailed(ctx, job.ID, errorCode, errorMessage)
+					p.db.PauseTenant(ctx, job.TenantID, "POLICY_VIOLATION")
 				} else {
 					log.Printf("Worker %d: permanent failure for job %s: %v", id, job.ID, err)
-					p.db.MarkJobFailed(job.ID, errorCode, errorMessage)
+					p.db.MarkJobFailed(ctx, job.ID, errorCode, errorMessage)
 				}
 				continue
 			}
@@ -143,17 +143,17 @@ func (p *WorkerPool) workerLoop(ctx context.Context, id int) (exited bool) {
 			// 6. On success: Bind the wamid to the internal job ID.
 			// This is CRITICAL — if SetJobMetaID fails, delivery status webhooks
 			// from Meta will never match this job, creating an orphaned record.
-			if err := p.db.SetJobMetaID(job.ID, wamid); err != nil {
+			if err := p.db.SetJobMetaID(ctx, job.ID, wamid); err != nil {
 				log.Printf("Worker %d: CRITICAL: failed to bind wamid %s to job %s: %v", id, wamid, job.ID, err)
 				// Fallback: mark accepted by job ID directly so it doesn't stay stuck in "processing"
-				if err := p.db.UpdateJobStatus(job.ID, "accepted", 2); err != nil {
+				if err := p.db.UpdateJobStatus(ctx, job.ID, "accepted", 2); err != nil {
 					log.Printf("Worker %d: ERROR: fallback UpdateJobStatus also failed for job %s: %v", id, job.ID, err)
 				}
 				continue
 			}
 
 			// Monotonic update to "accepted" (Level 2) by wamid
-			if _, err := p.db.UpdateJobMonotonic(wamid, "accepted", 2); err != nil {
+			if _, err := p.db.UpdateJobMonotonic(ctx, wamid, "accepted", 2); err != nil {
 				log.Printf("Worker %d: error updating job %s to accepted: %v", id, job.ID, err)
 			}
 		}

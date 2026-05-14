@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -231,11 +232,21 @@ type SendMessageParams struct {
 	IdempotencyKey *string `json:"Idempotency-Key,omitempty"`
 }
 
+// GetV1MetaWebhookParams defines parameters for GetV1MetaWebhook.
+type GetV1MetaWebhookParams struct {
+	HubMode        string `form:"hub.mode" json:"hub.mode"`
+	HubChallenge   string `form:"hub.challenge" json:"hub.challenge"`
+	HubVerifyToken string `form:"hub.verify_token" json:"hub.verify_token"`
+}
+
 // SyncTenantJSONRequestBody defines body for SyncTenant for application/json ContentType.
 type SyncTenantJSONRequestBody SyncTenantJSONBody
 
 // SendMessageJSONRequestBody defines body for SendMessage for application/json ContentType.
 type SendMessageJSONRequestBody = SendMessageRequest
+
+// PostV1MetaWebhookJSONRequestBody defines body for PostV1MetaWebhook for application/json ContentType.
+type PostV1MetaWebhookJSONRequestBody = WebhookPayload
 
 // AsTenant returns the union data inside the SyncTenantJSONBody as a Tenant
 func (t SyncTenantJSONBody) AsTenant() (Tenant, error) {
@@ -313,6 +324,12 @@ type ServerInterface interface {
 	// Send a WhatsApp message
 	// (POST /v1/messages)
 	SendMessage(w http.ResponseWriter, r *http.Request, params SendMessageParams)
+	// Meta Webhook Verification
+	// (GET /v1/meta/webhook)
+	GetV1MetaWebhook(w http.ResponseWriter, r *http.Request, params GetV1MetaWebhookParams)
+	// Meta Webhook Payload Receiver
+	// (POST /v1/meta/webhook)
+	PostV1MetaWebhook(w http.ResponseWriter, r *http.Request)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -428,6 +445,79 @@ func (siw *ServerInterfaceWrapper) SendMessage(w http.ResponseWriter, r *http.Re
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.SendMessage(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetV1MetaWebhook operation middleware
+func (siw *ServerInterfaceWrapper) GetV1MetaWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetV1MetaWebhookParams
+
+	// ------------- Required query parameter "hub.mode" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "hub.mode", r.URL.Query(), &params.HubMode, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "hub.mode"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "hub.mode", Err: err})
+		}
+		return
+	}
+
+	// ------------- Required query parameter "hub.challenge" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "hub.challenge", r.URL.Query(), &params.HubChallenge, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "hub.challenge"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "hub.challenge", Err: err})
+		}
+		return
+	}
+
+	// ------------- Required query parameter "hub.verify_token" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "hub.verify_token", r.URL.Query(), &params.HubVerifyToken, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "hub.verify_token"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "hub.verify_token", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetV1MetaWebhook(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostV1MetaWebhook operation middleware
+func (siw *ServerInterfaceWrapper) PostV1MetaWebhook(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostV1MetaWebhook(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -561,8 +651,385 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/internal/tenants/{id}/pause", wrapper.PauseTenant)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/internal/webhook-schema", wrapper.ForceGenerateWebhookType)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/messages", wrapper.SendMessage)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/meta/webhook", wrapper.GetV1MetaWebhook)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/meta/webhook", wrapper.PostV1MetaWebhook)
 
 	return m
+}
+
+type SyncTenantRequestObject struct {
+	Body *SyncTenantJSONRequestBody
+}
+
+type SyncTenantResponseObject interface {
+	VisitSyncTenantResponse(w http.ResponseWriter) error
+}
+
+type SyncTenant200Response struct {
+}
+
+func (response SyncTenant200Response) VisitSyncTenantResponse(w http.ResponseWriter) error {
+	w.WriteHeader(200)
+	return nil
+}
+
+type PauseTenantRequestObject struct {
+	Id string `json:"id"`
+}
+
+type PauseTenantResponseObject interface {
+	VisitPauseTenantResponse(w http.ResponseWriter) error
+}
+
+type PauseTenant204Response struct {
+}
+
+func (response PauseTenant204Response) VisitPauseTenantResponse(w http.ResponseWriter) error {
+	w.WriteHeader(204)
+	return nil
+}
+
+type ForceGenerateWebhookTypeRequestObject struct {
+}
+
+type ForceGenerateWebhookTypeResponseObject interface {
+	VisitForceGenerateWebhookTypeResponse(w http.ResponseWriter) error
+}
+
+type ForceGenerateWebhookType200JSONResponse WebhookPayload
+
+func (response ForceGenerateWebhookType200JSONResponse) VisitForceGenerateWebhookTypeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SendMessageRequestObject struct {
+	Params SendMessageParams
+	Body   *SendMessageJSONRequestBody
+}
+
+type SendMessageResponseObject interface {
+	VisitSendMessageResponse(w http.ResponseWriter) error
+}
+
+type SendMessage202JSONResponse struct {
+	Data      *SendMessageResponse `json:"data,omitempty"`
+	RequestId *string              `json:"request_id,omitempty"`
+	Success   bool                 `json:"success"`
+}
+
+func (response SendMessage202JSONResponse) VisitSendMessageResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(202)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SendMessage400JSONResponse ErrorResponse
+
+func (response SendMessage400JSONResponse) VisitSendMessageResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SendMessage401Response struct {
+}
+
+func (response SendMessage401Response) VisitSendMessageResponse(w http.ResponseWriter) error {
+	w.WriteHeader(401)
+	return nil
+}
+
+type SendMessage429Response struct {
+}
+
+func (response SendMessage429Response) VisitSendMessageResponse(w http.ResponseWriter) error {
+	w.WriteHeader(429)
+	return nil
+}
+
+type GetV1MetaWebhookRequestObject struct {
+	Params GetV1MetaWebhookParams
+}
+
+type GetV1MetaWebhookResponseObject interface {
+	VisitGetV1MetaWebhookResponse(w http.ResponseWriter) error
+}
+
+type GetV1MetaWebhook200TextResponse string
+
+func (response GetV1MetaWebhook200TextResponse) VisitGetV1MetaWebhookResponse(w http.ResponseWriter) error {
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(200)
+
+	_, err := w.Write([]byte(response))
+	return err
+}
+
+type GetV1MetaWebhook403Response struct {
+}
+
+func (response GetV1MetaWebhook403Response) VisitGetV1MetaWebhookResponse(w http.ResponseWriter) error {
+	w.WriteHeader(403)
+	return nil
+}
+
+type PostV1MetaWebhookRequestObject struct {
+	Body *PostV1MetaWebhookJSONRequestBody
+}
+
+type PostV1MetaWebhookResponseObject interface {
+	VisitPostV1MetaWebhookResponse(w http.ResponseWriter) error
+}
+
+type PostV1MetaWebhook200Response struct {
+}
+
+func (response PostV1MetaWebhook200Response) VisitPostV1MetaWebhookResponse(w http.ResponseWriter) error {
+	w.WriteHeader(200)
+	return nil
+}
+
+// StrictServerInterface represents all server handlers.
+type StrictServerInterface interface {
+	// Sync or provision a tenant
+	// (POST /v1/internal/tenant)
+	SyncTenant(ctx context.Context, request SyncTenantRequestObject) (SyncTenantResponseObject, error)
+	// Pause a tenant
+	// (PUT /v1/internal/tenants/{id}/pause)
+	PauseTenant(ctx context.Context, request PauseTenantRequestObject) (PauseTenantResponseObject, error)
+
+	// (POST /v1/internal/webhook-schema)
+	ForceGenerateWebhookType(ctx context.Context, request ForceGenerateWebhookTypeRequestObject) (ForceGenerateWebhookTypeResponseObject, error)
+	// Send a WhatsApp message
+	// (POST /v1/messages)
+	SendMessage(ctx context.Context, request SendMessageRequestObject) (SendMessageResponseObject, error)
+	// Meta Webhook Verification
+	// (GET /v1/meta/webhook)
+	GetV1MetaWebhook(ctx context.Context, request GetV1MetaWebhookRequestObject) (GetV1MetaWebhookResponseObject, error)
+	// Meta Webhook Payload Receiver
+	// (POST /v1/meta/webhook)
+	PostV1MetaWebhook(ctx context.Context, request PostV1MetaWebhookRequestObject) (PostV1MetaWebhookResponseObject, error)
+}
+
+type StrictHandlerFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error)
+type StrictMiddlewareFunc func(f StrictHandlerFunc, operationID string) StrictHandlerFunc
+
+type StrictHTTPServerOptions struct {
+	RequestErrorHandlerFunc  func(w http.ResponseWriter, r *http.Request, err error)
+	ResponseErrorHandlerFunc func(w http.ResponseWriter, r *http.Request, err error)
+}
+
+func NewStrictHandler(ssi StrictServerInterface, middlewares []StrictMiddlewareFunc) ServerInterface {
+	return &strictHandler{ssi: ssi, middlewares: middlewares, options: StrictHTTPServerOptions{
+		RequestErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		},
+		ResponseErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		},
+	}}
+}
+
+func NewStrictHandlerWithOptions(ssi StrictServerInterface, middlewares []StrictMiddlewareFunc, options StrictHTTPServerOptions) ServerInterface {
+	return &strictHandler{ssi: ssi, middlewares: middlewares, options: options}
+}
+
+type strictHandler struct {
+	ssi         StrictServerInterface
+	middlewares []StrictMiddlewareFunc
+	options     StrictHTTPServerOptions
+}
+
+// SyncTenant operation middleware
+func (sh *strictHandler) SyncTenant(w http.ResponseWriter, r *http.Request) {
+	var request SyncTenantRequestObject
+
+	var body SyncTenantJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SyncTenant(ctx, request.(SyncTenantRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SyncTenant")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SyncTenantResponseObject); ok {
+		if err := validResponse.VisitSyncTenantResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PauseTenant operation middleware
+func (sh *strictHandler) PauseTenant(w http.ResponseWriter, r *http.Request, id string) {
+	var request PauseTenantRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PauseTenant(ctx, request.(PauseTenantRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PauseTenant")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PauseTenantResponseObject); ok {
+		if err := validResponse.VisitPauseTenantResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ForceGenerateWebhookType operation middleware
+func (sh *strictHandler) ForceGenerateWebhookType(w http.ResponseWriter, r *http.Request) {
+	var request ForceGenerateWebhookTypeRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ForceGenerateWebhookType(ctx, request.(ForceGenerateWebhookTypeRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ForceGenerateWebhookType")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ForceGenerateWebhookTypeResponseObject); ok {
+		if err := validResponse.VisitForceGenerateWebhookTypeResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// SendMessage operation middleware
+func (sh *strictHandler) SendMessage(w http.ResponseWriter, r *http.Request, params SendMessageParams) {
+	var request SendMessageRequestObject
+
+	request.Params = params
+
+	var body SendMessageJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SendMessage(ctx, request.(SendMessageRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SendMessage")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SendMessageResponseObject); ok {
+		if err := validResponse.VisitSendMessageResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetV1MetaWebhook operation middleware
+func (sh *strictHandler) GetV1MetaWebhook(w http.ResponseWriter, r *http.Request, params GetV1MetaWebhookParams) {
+	var request GetV1MetaWebhookRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetV1MetaWebhook(ctx, request.(GetV1MetaWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetV1MetaWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetV1MetaWebhookResponseObject); ok {
+		if err := validResponse.VisitGetV1MetaWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PostV1MetaWebhook operation middleware
+func (sh *strictHandler) PostV1MetaWebhook(w http.ResponseWriter, r *http.Request) {
+	var request PostV1MetaWebhookRequestObject
+
+	var body PostV1MetaWebhookJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PostV1MetaWebhook(ctx, request.(PostV1MetaWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PostV1MetaWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PostV1MetaWebhookResponseObject); ok {
+		if err := validResponse.VisitPostV1MetaWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
 }
 
 // Base64 encoded, compressed with deflate, json marshaled OpenAPI spec.
@@ -570,38 +1037,40 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
-	"UkphWxDMNbAb5B53alDWIdTAbfKOwF3/LwAA//8=",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

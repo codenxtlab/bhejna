@@ -77,22 +77,22 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 							IsMatched:      false,
 						}
 
-						matched, err := database.UpdateJobMonotonic(*status.Id, statusStr, level)
+						matched, err := database.UpdateJobMonotonic(r.Context(), *status.Id, statusStr, level)
 						if err != nil {
 							log.Printf("[Webhook] ERROR: UpdateJobMonotonic failed for wamid %s: %v", *status.Id, err)
 						}
 						if matched {
 							event.IsMatched = true
 							// Enqueue for client egress
-							tenant, err := database.GetTenantByWabaID(entry.Id)
+							tenant, err := database.GetTenantByWabaID(r.Context(), entry.Id)
 							if err == nil && tenant != nil {
-								if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
+								if err := database.EnqueueClientWebhook(r.Context(), tenant.ID, string(body)); err != nil {
 									log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for tenant %s: %v", tenant.ID, err)
 								}
 							}
 						}
 
-						if err := database.InsertWebhookEvent(event); err != nil {
+						if err := database.InsertWebhookEvent(r.Context(), event); err != nil {
 							log.Printf("[Webhook] ERROR: InsertWebhookEvent failed: %v", err)
 						}
 					}
@@ -107,15 +107,15 @@ func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
 
 						phoneID := *change.Value.Metadata.PhoneNumberId
 						if phoneID != "" {
-							tenant, err := database.GetTenantByPhoneNumberID(phoneID)
+							tenant, err := database.GetTenantByPhoneNumberID(r.Context(), phoneID)
 							if err == nil && tenant != nil {
 								// Open the 24-hour free messaging window
-								if err := database.UpsertActiveSession(tenant.ID, *msg.From); err != nil {
+								if err := database.UpsertActiveSession(r.Context(), tenant.ID, *msg.From); err != nil {
 									log.Printf("[Webhook] ERROR: UpsertActiveSession failed for tenant %s: %v", tenant.ID, err)
 								}
 
 								// Forward the inbound message to the client's webhook
-								if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
+								if err := database.EnqueueClientWebhook(r.Context(), tenant.ID, string(body)); err != nil {
 									log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for inbound message, tenant %s: %v", tenant.ID, err)
 								}
 							}

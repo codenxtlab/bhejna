@@ -22,22 +22,22 @@ type Tenant struct {
 }
 
 type Job struct {
-	ID             string         `db:"id"`
-	TenantID       string         `db:"tenant_id"`
-	RecipientPhone string         `db:"recipient_phone"`
-	MessageType    string         `db:"message_type"`
-	MessagePayload string         `db:"message_payload"`
-	Status         string         `db:"status"`
-	StatusLevel    int            `db:"status_level"`
-	MetaMessageID  sql.NullString `db:"meta_message_id"`
-	MetaErrorCode  sql.NullString `db:"meta_error_code"`
+	ID               string         `db:"id"`
+	TenantID         string         `db:"tenant_id"`
+	RecipientPhone   string         `db:"recipient_phone"`
+	MessageType      string         `db:"message_type"`
+	MessagePayload   string         `db:"message_payload"`
+	Status           string         `db:"status"`
+	StatusLevel      int            `db:"status_level"`
+	MetaMessageID    sql.NullString `db:"meta_message_id"`
+	MetaErrorCode    sql.NullString `db:"meta_error_code"`
 	MetaErrorMessage sql.NullString `db:"meta_error_message"`
-	RetryCount     int            `db:"retry_count"`
-	NextRetryAt    time.Time      `db:"next_retry_at"`
-	Synced         bool           `db:"synced"`
-	IdempotencyKey *string        `db:"idempotency_key"`
-	CreatedAt      time.Time      `db:"created_at"`
-	UpdatedAt      time.Time      `db:"updated_at"`
+	RetryCount       int            `db:"retry_count"`
+	NextRetryAt      time.Time      `db:"next_retry_at"`
+	Synced           bool           `db:"synced"`
+	IdempotencyKey   *string        `db:"idempotency_key"`
+	CreatedAt        time.Time      `db:"created_at"`
+	UpdatedAt        time.Time      `db:"updated_at"`
 }
 
 type WebhookEvent struct {

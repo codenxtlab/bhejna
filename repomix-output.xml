@@ -1,0 +1,5888 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+cmd/
+  bhejna/
+    main.go
+docs/
+  api/
+    overview.md
+  architecture/
+    system-overview.md
+  concurrency/
+    goroutine-model.md
+  internal/
+    request-lifecycle.md
+  onboarding/
+    local-setup.md
+  operations/
+    deployment.md
+  security/
+    authentication.md
+  errors.md
+  examples.md
+  openapi.yaml
+  public-api.md
+  README.md
+  webhooks.md
+internal/
+  api/
+    generated/
+      api.gen.go
+      oapi-codegen.yaml
+    handlers/
+      meta_webhook.go
+    spec/
+      openapi.yaml
+    client.go
+    generate.go
+    internal.go
+    middleware.go
+    server.go
+    webhook.go
+  db/
+    db.go
+    models.go
+    repository.go
+    schema.sql
+  engine/
+    cleanup.go
+    janitor.go
+    limiter.go
+    meta_client.go
+    sync.go
+    webhook_worker.go
+    worker.go
+  services/
+    webhook_dispatcher.go
+.gitignore
+bhejna
+Caddyfile
+docker-compose.yml
+Dockerfile
+go.mod
+public_api_docs.md
+README.md
+test_idempotency.db-shm
+test_idempotency.db-wal
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="internal/api/handlers/meta_webhook.go">
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+
+	"github.com/codenxtlab/bhejna/internal/api/generated"
+	"github.com/codenxtlab/bhejna/internal/db"
+	"github.com/codenxtlab/bhejna/internal/services"
+	"github.com/oklog/ulid/v2"
+)
+
+var statusLevels = map[string]int{
+	"sent":      3,
+	"delivered": 4,
+	"read":      5,
+	"failed":    3,
+}
+
+type MetaWebhook struct {
+	db              *db.DB
+	dispatcher      *services.WebhookDispatcher
+	metaVerifyToken string
+}
+
+func NewMetaWebhook(database *db.DB, dispatcher *services.WebhookDispatcher, metaVerifyToken string) *MetaWebhook {
+	return &MetaWebhook{
+		db:              database,
+		dispatcher:      dispatcher,
+		metaVerifyToken: metaVerifyToken,
+	}
+}
+
+// extractPhoneNumberID safely extracts the phone number ID without panicking on nil pointers
+func extractPhoneNumberID(payload *generated.WebhookPayload) string {
+	if payload == nil || len(payload.Entry) == 0 {
+		return ""
+	}
+	entry := payload.Entry[0]
+	if len(entry.Changes) == 0 {
+		return ""
+	}
+	change := entry.Changes[0]
+	if change.Value.Metadata == nil || change.Value.Metadata.PhoneNumberId == nil {
+		return ""
+	}
+	return *change.Value.Metadata.PhoneNumberId
+}
+
+// GetV1MetaWebhook implements the strict interface method for verifying the webhook
+func (h *MetaWebhook) GetV1MetaWebhook(ctx context.Context, request generated.GetV1MetaWebhookRequestObject) (generated.GetV1MetaWebhookResponseObject, error) {
+	if request.Params.HubMode == "subscribe" && request.Params.HubVerifyToken == h.metaVerifyToken {
+		return generated.GetV1MetaWebhook200TextResponse(request.Params.HubChallenge), nil
+	}
+
+	return generated.GetV1MetaWebhook403Response{}, nil
+}
+
+// PostV1MetaWebhook implements the strict interface method for receiving Meta payloads
+func (h *MetaWebhook) PostV1MetaWebhook(ctx context.Context, request generated.PostV1MetaWebhookRequestObject) (generated.PostV1MetaWebhookResponseObject, error) {
+	if request.Body == nil {
+		return generated.PostV1MetaWebhook200Response{}, nil
+	}
+
+	// 1. Context Cancellation Fix: Detach context to prevent cancellation when HTTP response completes
+	bgCtx := context.WithoutCancel(ctx)
+
+	// Re-marshal to get raw payload for dispatcher since strict server consumed it
+	rawPayload, err := json.Marshal(request.Body)
+	if err != nil {
+		log.Printf("[MetaWebhook] Failed to marshal strict payload: %v", err)
+		return generated.PostV1MetaWebhook200Response{}, nil
+	}
+
+	// 2. Goroutine Variable Capture Fix: Explicitly pass variables to avoid race conditions
+	go func(payload *generated.WebhookPayload, raw []byte, c context.Context) {
+		// Safe extraction to prevent Deep Nil-Pointer Panics
+		phoneID := extractPhoneNumberID(payload)
+		if phoneID != "" {
+			// Fire Egress Dispatcher
+			go func(p []byte, id string, childCtx context.Context) {
+				h.dispatcher.Dispatch(childCtx, p, id)
+			}(raw, phoneID, c)
+		}
+
+		// Fire existing internal logic for DB updates
+		h.processInternalLogic(c, raw, *payload)
+	}(request.Body, rawPayload, bgCtx)
+
+	// Immediately return 200 OK so Meta doesn't retry
+	return generated.PostV1MetaWebhook200Response{}, nil
+}
+
+func (h *MetaWebhook) processInternalLogic(_ context.Context, body []byte, payload generated.WebhookPayload) {
+	for _, entry := range payload.Entry {
+		for _, change := range entry.Changes {
+			// Status Updates (Delivery Receipts)
+			if change.Value.Statuses != nil {
+				for _, status := range *change.Value.Statuses {
+					if status.Status == nil || status.Id == nil {
+						continue
+					}
+
+					statusStr := string(*status.Status)
+					level, exists := statusLevels[statusStr]
+					if !exists {
+						continue
+					}
+
+					event := &db.WebhookEvent{
+						ID:             ulid.Make().String(),
+						IdempotencyKey: *status.Id + ":" + statusStr,
+						WabaID:         entry.Id,
+						EventType:      statusStr,
+						RawPayload:     string(body),
+						IsMatched:      false,
+					}
+
+					matched, err := h.db.UpdateJobMonotonic(*status.Id, statusStr, level)
+					if err != nil {
+						log.Printf("[Webhook] ERROR: UpdateJobMonotonic failed for wamid %s: %v", *status.Id, err)
+					}
+					if matched {
+						event.IsMatched = true
+					}
+
+					if err := h.db.InsertWebhookEvent(event); err != nil {
+						log.Printf("[Webhook] ERROR: InsertWebhookEvent failed: %v", err)
+					}
+				}
+			}
+
+			// Inbound Messages (User replied)
+			if change.Value.Messages != nil {
+				for _, msg := range *change.Value.Messages {
+					if msg.From == nil {
+						continue
+					}
+
+					// Safely extract metadata using pointer checks
+					if change.Value.Metadata == nil || change.Value.Metadata.PhoneNumberId == nil {
+						continue
+					}
+
+					phoneID := *change.Value.Metadata.PhoneNumberId
+					if phoneID != "" {
+						tenant, err := h.db.GetTenantByPhoneNumberID(phoneID)
+						if err == nil && tenant != nil {
+							// Open the 24-hour free messaging window
+							if err := h.db.UpsertActiveSession(tenant.ID, *msg.From); err != nil {
+								log.Printf("[Webhook] ERROR: UpsertActiveSession failed for tenant %s: %v", tenant.ID, err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+</file>
+
+<file path="internal/api/server.go">
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/codenxtlab/bhejna/internal/api/generated"
+	"github.com/codenxtlab/bhejna/internal/api/handlers"
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+// Server implements generated.ServerInterface
+type Server struct {
+	DB             *db.DB
+	InternalSecret string
+	WebhookHandler *handlers.MetaWebhook
+}
+
+func (s *Server) SyncTenant(w http.ResponseWriter, r *http.Request) {
+	HandleSyncTenant(s.DB, s.InternalSecret).ServeHTTP(w, r)
+}
+
+func (s *Server) PauseTenant(w http.ResponseWriter, r *http.Request, id string) {
+	// The generated interface passes `id` parameter, but our current handler
+	// relies on chi.URLParam(r, "id"). So we must ensure it's set in context,
+	// or we pass it directly. Since chi is still routing, chi.URLParam will work.
+	HandlePauseTenant(s.DB).ServeHTTP(w, r)
+}
+
+func (s *Server) ForceGenerateWebhookType(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) SendMessage(w http.ResponseWriter, r *http.Request, params generated.SendMessageParams) {
+	// The params are handled by HandleSendMessage internally (reads headers).
+	HandleSendMessage(s.DB).ServeHTTP(w, r)
+}
+
+func (s *Server) GetV1MetaWebhook(w http.ResponseWriter, r *http.Request, params generated.GetV1MetaWebhookParams) {
+	req := generated.GetV1MetaWebhookRequestObject{Params: params}
+	res, _ := s.WebhookHandler.GetV1MetaWebhook(r.Context(), req)
+	if res != nil {
+		res.VisitGetV1MetaWebhookResponse(w)
+	}
+}
+
+func (s *Server) PostV1MetaWebhook(w http.ResponseWriter, r *http.Request) {
+	var payload generated.WebhookPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	req := generated.PostV1MetaWebhookRequestObject{Body: &payload}
+	res, _ := s.WebhookHandler.PostV1MetaWebhook(r.Context(), req)
+	if res != nil {
+		res.VisitPostV1MetaWebhookResponse(w)
+	}
+}
+</file>
+
+<file path="internal/services/webhook_dispatcher.go">
+package services
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+type WebhookDispatcher struct {
+	db     *db.DB
+	client *http.Client
+}
+
+// NewWebhookDispatcher creates a new dispatcher
+// 3. HTTP Client Pooling & Leaks Fix: Ensure http.Client is a single, long-lived instance with timeout
+func NewWebhookDispatcher(database *db.DB) *WebhookDispatcher {
+	return &WebhookDispatcher{
+		db: database,
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+		},
+	}
+}
+
+func (d *WebhookDispatcher) Dispatch(ctx context.Context, payload []byte, phoneNumberID string) {
+	tenant, err := d.db.GetTenantByPhoneNumberID(phoneNumberID)
+	if err != nil {
+		log.Printf("[WebhookDispatcher] Error querying tenant for phone_number_id %s: %v", phoneNumberID, err)
+		return
+	}
+	if tenant == nil {
+		log.Printf("[WebhookDispatcher] Tenant not found for phone_number_id %s", phoneNumberID)
+		return
+	}
+	if tenant.WebhookURL == nil || *tenant.WebhookURL == "" {
+		log.Printf("[WebhookDispatcher] Tenant %s has no WebhookURL configured, dropping message", tenant.ID)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, *tenant.WebhookURL, bytes.NewReader(payload))
+	if err != nil {
+		log.Printf("[WebhookDispatcher] Error creating HTTP request for tenant %s: %v", tenant.ID, err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	if tenant.WebhookSecret != nil && *tenant.WebhookSecret != "" {
+		mac := hmac.New(sha256.New, []byte(*tenant.WebhookSecret))
+		mac.Write(payload)
+		signature := hex.EncodeToString(mac.Sum(nil))
+		req.Header.Set("X-Bhejna-Signature", "sha256="+signature)
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		log.Printf("[WebhookDispatcher] Error dispatching to tenant %s: %v", tenant.ID, err)
+		return
+	}
+	// 3. HTTP Client Pooling & Leaks Fix: MUST defer resp.Body.Close() immediately after checking errors
+	defer resp.Body.Close()
+
+	// 3. HTTP Client Pooling & Leaks Fix: Recycle the TCP connection by reading the body fully
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		log.Printf("[WebhookDispatcher] Warning: Error draining response body for tenant %s: %v", tenant.ID, err)
+	}
+
+	if resp.StatusCode >= 400 {
+		log.Printf("[WebhookDispatcher] Tenant %s webhook returned status: %s", tenant.ID, resp.Status)
+	} else {
+		log.Printf("[WebhookDispatcher] Successfully dispatched to tenant %s webhook (Status: %s)", tenant.ID, resp.Status)
+	}
+}
+</file>
+
+<file path="docs/api/overview.md">
+# API Overview
+
+Bhejna provides two distinct API surfaces: the **External Client API** and the **Internal Control Plane**.
+
+## 1. External Client API
+Base URL: `/v1`
+
+### POST /messages
+Dispatches a WhatsApp message.
+- **Auth**: `Authorization: Bearer <tenant_token>`
+- **Headers**: `Idempotency-Key` (Optional, ULID recommended)
+- **Body**:
+```json
+{
+    "recipient": "+1234567890",
+    "message_type": "template",
+    "payload": {
+        "name": "hello_world",
+        "language": { "code": "en_US" }
+    }
+}
+```
+- **Responses**:
+    - `202 Accepted`: Job enqueued.
+    - `401 Unauthorized`: Invalid token.
+    - `403 Forbidden`: Tenant is paused.
+    - `429 Too Many Requests`: 24h quota exceeded.
+
+## 2. Webhook Ingress
+Endpoint: `/webhook`
+
+### GET /webhook
+Handles Meta's verification challenge.
+- **Query Params**: `hub.mode`, `hub.verify_token`, `hub.challenge`.
+
+### POST /webhook
+Processes delivery receipts and inbound messages.
+- **Security**: Validates `X-Hub-Signature-256`.
+- **Response**: Always returns `200 OK` to Meta to prevent retry loops.
+
+## 3. Internal Control Plane
+Base URL: `/v1/internal`
+
+### POST /internal/tenant
+Synchronizes tenant metadata from the management system.
+- **Auth**: `INTERNAL_SECRET` check.
+- **Action**: Upserts tenant WABA IDs and credentials.
+
+### PUT /internal/tenants/{id}/pause
+Manually pauses a tenant.
+- **Auth**: `INTERNAL_SECRET` check.
+</file>
+
+<file path="docs/architecture/system-overview.md">
+# System Architecture Overview
+
+Bhejna is designed as a **Transactional Job Engine** that proxies communication between client applications and the Meta Graph API (WhatsApp Business API).
+
+## High-Level Subsystems
+
+### 1. Ingress API (The Receiver)
+The Chi-based HTTP server that accepts message requests and Meta webhooks.
+- **Client Endpoints**: Handles `/v1/messages`.
+- **Webhook Endpoints**: Handles verification and event receipts from Meta.
+
+### 2. Job Engine (The Core)
+A persistent queue implemented on top of SQLite 3 in WAL mode.
+- **Persistence**: Every message is stored before dispatch.
+- **State Management**: Uses monotonic level-based updates to handle asynchronous events.
+
+### 3. Worker Pools (The Executors)
+- **Message Workers**: Claim jobs and interact with Meta Graph API.
+- **Webhook Workers**: Forward events back to client-defined URLs.
+
+### 4. Integration Layer (Supabase)
+- **Sync Worker**: Periodically pushes terminal states to Supabase Analytics.
+- **Hydration**: Pulls tenant data at boot-time to warm the local cache.
+
+## Architecture Diagram
+
+```mermaid
+graph TD
+    Client[Client App] -->|HTTPS POST| Ingress[Ingress API]
+    Ingress -->|Write| Queue[(SQLite WAL Queue)]
+    
+    subgraph "Internal Processing"
+        Queue -->|Claim| Workers[Message Workers]
+        Workers -->|v25.0 POST| Meta[Meta Graph API]
+    end
+    
+    Meta -->|Delivery Receipt| Ingress
+    Ingress -->|Update Level| Queue
+    
+    subgraph "Egress Processing"
+        Queue -->|Poll| Egress[Webhook Workers]
+        Egress -->|Callback| ClientURL[Client Webhook]
+    end
+    
+    subgraph "Cloud Persistence"
+        Queue -->|Sync| Supabase[(Supabase Analytics)]
+    end
+```
+
+## Component Boundaries
+- **Stateless**: The API layer and Workers carry no persistent state.
+- **Stateful**: The SQLite database (`bhejna.db`) is the single source of truth for the local node.
+- **Authoritative**: Supabase acts as the global registry for tenant metadata.
+</file>
+
+<file path="docs/concurrency/goroutine-model.md">
+# Concurrency Model & SQLite Serialization
+
+Bhejna leverages Go's goroutines for high throughput while maintaining data integrity through strict SQLite serialization.
+
+## The Worker Pools
+
+### Message Dispatch Pool
+- **Purpose**: Processes the `jobs` table.
+- **Worker Count**: Configurable (Default: 5).
+- **Behavior**: Continuous polling with recovery on panic. Each worker operates independently.
+
+### Webhook Egress Pool
+- **Purpose**: Processes the `client_webhook_queue` table.
+- **Worker Count**: Configurable (Default: 10).
+- **Behavior**: Handles outbound HTTP calls to third-party servers. Designed to handle slow downstreams without blocking message dispatch.
+
+## SQLite WAL Management
+
+The system uses a **Split-Connection Pool** strategy to handle the "Single-Writer" limitation of SQLite.
+
+| Pool Type | `MaxOpenConns` | Purpose |
+| :--- | :--- | :--- |
+| **Writer** | **1** | All `INSERT`, `UPDATE`, `DELETE`. Ensures no `SQLITE_BUSY` locks. |
+| **Reader** | **10** | All `SELECT` queries. Enables concurrent API lookups. |
+
+### Database Busy Handling
+The DSN includes `_busy_timeout=5000`. If the single writer is busy (e.g., during a long transaction), subsequent writes will wait up to 5 seconds before erroring.
+
+## Concurrency Safety Invariants
+
+### 1. Monotonic Leveling
+Status updates are gated by levels:
+```sql
+UPDATE jobs SET status = ?, status_level = ? 
+WHERE meta_message_id = ? AND status_level < ?
+```
+This prevents a late "sent" webhook from overwriting a "delivered" status.
+
+### 2. Job Claiming Atomicity
+Workers claim jobs using an atomic CTE-like update in SQLite:
+```sql
+UPDATE jobs SET status = 'processing' 
+WHERE id = (SELECT id FROM jobs WHERE status = 'queued' LIMIT 1)
+RETURNING *;
+```
+This ensures that no two workers can process the same message simultaneously.
+
+### 3. Graceful Shutdown
+The system uses `context.WithCancel` for all background tasks. On SIGTERM:
+1. The API server stops accepting new requests.
+2. The context is cancelled.
+3. Workers finish their **in-flight** jobs.
+4. The DB connection is closed after workers drain.
+</file>
+
+<file path="docs/internal/request-lifecycle.md">
+# Request Lifecycle & Flow
+
+This document traces the path of a message from the initial client request to final reconciliation.
+
+## 1. Dispatch Phase (Ingress)
+1. **HTTP Handshake**: Client sends `POST /v1/messages` with a `Bearer` token and `Idempotency-Key`.
+2. **Middleware Chain**:
+    - `Logger` & `Recoverer`.
+    - `APIKeyMiddleware`: Resolves `tenant_id` from the DB and checks if `is_paused`.
+3. **Payload Sanitization**: 
+    - Body is capped at **256KB**.
+    - Phone number is stripped of spaces and validated against E.164.
+4. **Quota Guard**: `CountTenantJobsInWindow` queries SQLite to ensure the 24h limit isn't exceeded.
+5. **Enqueuing**: A job record is created with status `queued` (Level 0).
+6. **Response**: Client receives `202 Accepted` with a `job_id`.
+
+## 2. Processing Phase (Execution)
+1. **Claiming**: A worker calls `ClaimNextJob()`, moving the status to `processing` (Level 1).
+2. **Dispatch**: The `MetaAPIClient` constructs the WhatsApp envelope.
+3. **External I/O**: The request is sent to Meta's Graph API.
+4. **Response Handling**:
+    - **Success**: Meta returns a `wamid`. Internal job is updated to `accepted` (Level 2).
+    - **Transient Error (5xx)**: Job is requeued with jittered backoff.
+    - **Policy Error (4xx)**: Job is marked `failed` (Level 6); Tenant is paused.
+
+## 3. Reconciliation Phase (Webhook)
+1. **Callback**: Meta sends a POST to `/webhook`.
+2. **Signature Verification**: Middleware validates `X-Hub-Signature-256` using `META_APP_SECRET`.
+3. **Monotonic Update**: `UpdateJobMonotonic` is called.
+    - If status is "sent", update to Level 3.
+    - If status is "delivered", update to Level 4.
+    - If status is "read", update to Level 5.
+4. **Egress Enqueue**: If the status update was successful, the event is added to `client_webhook_queue`.
+
+## 4. Egress Phase (Callback)
+1. **Poll**: Webhook workers claim the egress job.
+2. **Callback**: The payload (including Meta's raw event) is POSTed to the client's `webhook_url`.
+3. **Signature**: `X-Bhejna-Signature` is added if the tenant has a `webhook_secret`.
+4. **Finality**: Job is marked `completed` in the egress queue.
+</file>
+
+<file path="docs/onboarding/local-setup.md">
+# Local Setup Guide
+
+Follow these steps to get Bhejna running on your local machine for development.
+
+## 1. Prerequisites
+- **Go**: Version 1.21 or higher.
+- **SQLite**: Version 3.35 or higher (required for `RETURNING` clause support).
+- **Meta Developer Account**: To test with real WhatsApp webhooks (or use ngrok).
+
+## 2. Environment Variables
+Bhejna reads configuration from environment variables or a `.env` file.
+
+| Variable | Description |
+| :--- | :--- |
+| `PORT` | The port to listen on (default: 8080). |
+| `DB_PATH` | Path to the SQLite file. |
+| `META_APP_SECRET` | Your Facebook App Secret. |
+| `INTERNAL_SECRET` | Shared secret for internal API calls. |
+| `META_VERIFY_TOKEN` | The token you set in Meta's Webhook configuration. |
+
+## 3. Installation
+```bash
+# Clone the repository
+git clone <repo_url>
+cd bhejna
+
+# Install dependencies
+go mod download
+```
+
+## 4. Running the Application
+```bash
+# Start in development mode
+go run cmd/bhejna/main.go
+```
+
+The application will:
+1. Create `bhejna.db` if it doesn't exist.
+2. Execute `schema.sql` to set up tables.
+3. Start the worker pools and the HTTP server.
+
+## 5. Development Workflow
+- **Adding Handlers**: Add routes in `main.go` and logic in `internal/api/`.
+- **Adding DB Methods**: Update `internal/db/repository.go` and the corresponding struct in `models.go`.
+- **Adding Workers**: Define worker logic in `internal/engine/`.
+
+## 6. Testing with Webhooks
+To receive webhooks from Meta on your local machine:
+1. Start ngrok: `ngrok http 8080`.
+2. Copy the HTTPS URL provided by ngrok.
+3. Go to the Meta Developer Portal -> WhatsApp -> Configuration.
+4. Set the Callback URL to `<ngrok_url>/webhook`.
+5. Set the Verify Token to your `META_VERIFY_TOKEN`.
+</file>
+
+<file path="docs/operations/deployment.md">
+# Operations & Deployment
+
+Bhejna is container-native and designed to run as a single-node engine per region.
+
+## Deployment Model
+
+### Docker
+The application is containerized using the provided `Dockerfile`. 
+- **Volumes**: The SQLite database file (`bhejna.db`) MUST be stored on a persistent volume to survive container restarts.
+- **Reverse Proxy**: It is recommended to run Bhejna behind Caddy or Nginx for SSL termination.
+
+### Scaling Assumption
+Bhejna is **vertically scalable**. A single instance can handle thousands of messages per second due to the non-blocking nature of the worker pools. Horizontal scaling requires LiteFS or moving to a centralized PostgreSQL.
+
+## Failure Scenarios
+
+### Database Outage (Rare for SQLite)
+- **Impact**: All API calls will 500. Workers will stop.
+- **Recovery**: Check file permissions on the DB volume. Ensure `bhejna.db` is not corrupted.
+
+### Redis Outage
+- **Impact**: Currently, Bhejna does NOT use Redis. Rate limits are in-memory.
+- **Benefit**: Zero-dependency runtime.
+- **Trade-off**: Restarts reset rate limit counters.
+
+---
+
+# Onboarding: Local Setup
+
+## 1. Prerequisites
+- Go 1.21+
+- SQLite 3
+- (Optional) Docker
+
+## 2. Environment Setup
+Create a `.env` file in the root:
+```env
+DB_PATH=bhejna.db
+PORT=8080
+META_APP_SECRET=your_secret
+INTERNAL_SECRET=your_secret
+META_VERIFY_TOKEN=verify_me
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
+```
+
+## 3. Running the Server
+```bash
+go run cmd/bhejna/main.go
+```
+The database and schema will be automatically initialized on the first boot.
+
+## 4. Testing Endpoints
+Use `curl` to test the status:
+```bash
+curl http://localhost:8080/webhook?hub.mode=subscribe&hub.challenge=123&hub.verify_token=verify_me
+```
+Expected: `123`
+</file>
+
+<file path="docs/security/authentication.md">
+# Security & Authentication
+
+The Bhejna architecture enforces security at multiple levels of the stack.
+
+## Authentication Layers
+
+### 1. Client Authentication
+Clients must provide a `Bearer` token in the `Authorization` header.
+- **Lookup**: Tokens are resolved in the `tenants` table.
+- **Status Check**: If the `is_paused` flag is set, all requests are rejected with `403 Forbidden`.
+
+### 2. Meta Webhook Verification
+Meta sends delivery receipts via POST requests.
+- **HMAC Verification**: Bhejna calculates the HMAC-SHA256 signature of the raw body using the `META_APP_SECRET`.
+- **Integrity**: If the calculated signature doesn't match the `X-Hub-Signature-256` header, the request is rejected.
+
+### 3. Internal Control Plane
+Internal routes are protected by a shared `INTERNAL_SECRET`.
+- **Simplicity**: High-trust communication between the frontend server and the Go backend.
+
+## Security Invariants (Do Not Break)
+
+### I. Body Size Limiting
+All ingress points MUST limit request bodies:
+- **Client API**: 256KB Max.
+- **Webhooks**: 1MB Max (to accommodate large batch events).
+- Failure to enforce this leads to OOM (Out of Memory) vulnerabilities.
+
+### II. Body Exhaustion Prevention
+In Go, reading the request body exhausts the `io.Reader`. Middleware that verifies signatures (like `MetaSignatureMiddleware`) MUST restore the body using `io.NopCloser` to ensure subsequent handlers can process the JSON.
+
+### III. PII Sanitization
+- Logs should NOT contain `access_token` or full message payloads.
+- Log job IDs and metadata (phone ID, message type) only.
+
+## Secret Management
+Secrets should be provided via environment variables:
+- `META_APP_SECRET`
+- `INTERNAL_SECRET`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `META_VERIFY_TOKEN`
+</file>
+
+<file path="docs/errors.md">
+# Error Reference
+
+Bhejna uses standard HTTP status codes and a consistent error response format to help you debug integration issues.
+
+## Error Response Format
+
+All error responses follow this structure:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human readable explanation",
+    "retryable": false
+  },
+  "request_id": "req_123"
+}
+```
+
+---
+
+## HTTP Status Codes
+
+| Status | Code | Description | Retryable |
+|---|---|---|---|
+| 400 | `BAD_REQUEST` | Invalid JSON, missing fields, or validation failed. | No |
+| 401 | `UNAUTHORIZED` | Missing or invalid `X-API-Key`. | No |
+| 403 | `FORBIDDEN` | Tenant is paused or unauthorized for the action. | No |
+| 404 | `NOT_FOUND` | The requested resource does not exist. | No |
+| 429 | `RATE_LIMIT_EXCEEDED` | Messaging quota reached for the 24h window. | No |
+| 500 | `INTERNAL_SERVER_ERROR` | An unexpected error occurred on our side. | Yes |
+
+---
+
+## Internal Error Codes
+
+### `INVALID_PHONE`
+**HTTP Status**: 400
+**Description**: The recipient phone number does not match E.164 format.
+**Fix**: Ensure the phone number contains only digits and an optional leading `+`.
+
+### `PAYLOAD_TOO_LARGE`
+**HTTP Status**: 400
+**Description**: The message payload exceeds the 64KB limit.
+**Fix**: Reduce the size of your message payload or media metadata.
+
+### `QUOTA_EXCEEDED`
+**HTTP Status**: 429
+**Description**: Your tenant has reached the maximum allowed messages for the current window.
+**Fix**: Wait for the window to reset or contact support to increase your limit.
+
+### `IDEMPOTENCY_CONFLICT`
+**HTTP Status**: 202 (Accepted)
+**Description**: A request with this `Idempotency-Key` has already been processed.
+**Note**: This is not strictly an error but an advisory that we are returning the existing job.
+
+---
+
+## Troubleshooting Guidance
+
+1. **Check the `request_id`**: Always log the `request_id` returned in the response. It is the fastest way for our support team to help you.
+2. **Validate Payloads**: Use a JSON validator before sending requests. Bhejna strictly validates the `message_type` against allowed values.
+3. **Handle 5xx Errors**: If you receive a 500 error, wait a few seconds and retry with the same `Idempotency-Key`.
+</file>
+
+<file path="docs/examples.md">
+# Examples Library
+
+This library provides production-ready code examples for integrating with Bhejna.
+
+---
+
+## Sending a Text Message
+
+### cURL
+```bash
+curl -X POST https://api.bhejna.com/v1/messages \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipient": "+1234567890",
+    "message_type": "text",
+    "payload": {
+      "body": "Hello World"
+    }
+  }'
+```
+
+### TypeScript
+```typescript
+async function sendMessage() {
+  const res = await fetch('https://api.bhejna.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'X-API-Key': process.env.BHEJNA_API_KEY,
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'unique_key_123'
+    },
+    body: JSON.stringify({
+      recipient: '+1234567890',
+      message_type: 'text',
+      payload: { body: 'Hello from TS' }
+    })
+  });
+  const data = await res.json();
+  console.log(data);
+}
+```
+
+### Python
+```python
+import requests
+
+def send_message():
+    url = "https://api.bhejna.com/v1/messages"
+    headers = {
+        "X-API-Key": "YOUR_API_KEY",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "recipient": "+1234567890",
+        "message_type": "text",
+        "payload": {"body": "Hello from Python"}
+    }
+    response = requests.post(url, json=payload, headers=headers)
+    print(response.json())
+```
+
+---
+
+## Sending a Template Message
+
+### Go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+)
+
+func main() {
+	payload := map[string]interface{}{
+		"recipient": "+1234567890",
+		"message_type": "template",
+		"payload": map[string]interface{}{
+			"name": "hello_world",
+			"language": map[string]string{"code": "en_US"},
+		},
+	}
+	
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", "https://api.bhejna.com/v1/messages", bytes.NewBuffer(body))
+	req.Header.Set("X-API-Key", "YOUR_API_KEY")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	client.Do(req)
+}
+```
+
+---
+
+## Webhook Receiver (Node.js/Express)
+
+```javascript
+const express = require('express');
+const crypto = require('crypto');
+const app = express();
+
+app.use(express.json());
+
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+
+app.post('/webhook', (req, res) => {
+  const signature = req.headers['x-bhejna-signature'];
+  const body = JSON.stringify(req.body);
+  
+  const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET);
+  const expected = hmac.update(body).digest('hex');
+
+  if (signature !== expected) {
+    return res.status(401).send('Invalid signature');
+  }
+
+  // Process the event
+  console.log('Received event:', req.body);
+  
+  res.status(200).send('OK');
+});
+
+app.listen(3000);
+```
+
+---
+
+## Idempotent Retries
+
+When sending a message, always generate a unique key for each attempt to avoid duplicate charges or messages.
+
+```javascript
+const idempotencyKey = crypto.randomUUID();
+
+async function sendWithRetry() {
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await sendMessage(idempotencyKey);
+      if (res.ok) return;
+    } catch (e) {
+      // Exponential backoff
+      await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
+    }
+  }
+}
+```
+</file>
+
+<file path="docs/README.md">
+# Bhejna Engineering Documentation
+
+Welcome to the internal engineering documentation for the Bhejna Go API server. This documentation is intended for backend and infrastructure engineers to understand, maintain, and scale the system.
+
+## Sections
+
+### 🏗️ [Architecture](architecture/system-overview.md)
+High-level system design, subsystems, and component interactions.
+
+### 🔄 [Request Lifecycle](internal/request-lifecycle.md)
+Detailed trace of message dispatch and webhook reconciliation.
+
+### 🧵 [Concurrency Model](concurrency/goroutine-model.md)
+Goroutines, worker pools, and SQLite transaction management.
+
+### 🔌 [API Reference](api/overview.md)
+Internal and external API design and payload specifications.
+
+### 🔐 [Security & Invariants](security/authentication.md)
+Auth flow, signature verification, and system invariants.
+
+### ⚙️ [Operations](operations/deployment.md)
+Deployment, environment variables, and failure recovery.
+
+### 🚀 [Onboarding](onboarding/local-setup.md)
+Guide for new engineers to get started.
+
+---
+
+*Last Updated: May 2026*
+</file>
+
+<file path="docs/webhooks.md">
+# Webhook Documentation
+
+Webhooks allow Bhejna to notify your application in real-time about delivery status updates and inbound messages.
+
+## Delivery Guarantees
+
+- **At-least-once delivery**: Bhejna ensures webhooks are delivered at least once.
+- **Ordering**: Events are generally sent in order, but we recommend using timestamps for strictly ordered processing.
+- **Retries**: If your server returns anything other than a `2xx` status, Bhejna will retry up to 5 times with exponential backoff.
+
+---
+
+## Security & Verification
+
+Bhejna signs every webhook payload so you can verify it originated from our servers.
+
+### `X-Bhejna-Signature`
+This header contains an HMAC SHA256 signature of the raw request body, using your `webhook_secret` as the key.
+
+#### Go Verification Example
+```go
+func VerifySignature(body []byte, signature string, secret string) bool {
+    h := hmac.New(sha256.New, []byte(secret))
+    h.Write(body)
+    expected := hex.EncodeToString(h.Sum(nil))
+    return hmac.Equal([]byte(expected), []byte(signature))
+}
+```
+
+#### Node.js Verification Example
+```javascript
+const crypto = require('crypto');
+
+function verifySignature(body, signature, secret) {
+  const hmac = crypto.createHmac('sha256', secret);
+  const expected = hmac.update(body).digest('hex');
+  return expected === signature;
+}
+```
+
+---
+
+## Event Payloads
+
+Bhejna forwards the raw Meta webhook structure for maximum compatibility.
+
+### Delivery Update Example
+```json
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "WABA_ID",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "statuses": [
+              {
+                "id": "wamid.HBgLM...",
+                "status": "delivered",
+                "timestamp": "1622112345",
+                "recipient_id": "1234567890"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Inbound Message Example
+```json
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "WABA_ID",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "messages": [
+              {
+                "from": "1234567890",
+                "id": "wamid.HBgLM...",
+                "timestamp": "1622112345",
+                "type": "text",
+                "text": {
+                  "body": "Hello! I have a question."
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## Best Practices
+
+1. **Respond Quickly**: Return a `200 OK` as soon as you receive the payload. Process the event asynchronously.
+2. **Idempotency**: Use the `id` (wamid) in the payload to detect duplicate events.
+3. **HTTPS**: Always use an HTTPS endpoint for your `webhook_url`.
+</file>
+
+<file path="internal/api/generated/oapi-codegen.yaml">
+package: generated
+output: generated/api.gen.go
+generate:
+  models: true
+  std-http-server: true
+  strict-server: true
+  embedded-spec: true
+</file>
+
+<file path="internal/api/generate.go">
+package api
+
+//go:generate go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen --config=generated/oapi-codegen.yaml ../../docs/openapi.yaml
+</file>
+
+<file path="internal/engine/cleanup.go">
+package engine
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+// StartCleanupJanitor starts the background worker that purges old synced jobs.
+func StartCleanupJanitor(ctx context.Context, database *db.DB) {
+	// Run every 24 hours
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	log.Println("Cleanup Janitor started (24h cycle)")
+
+	// Run once on startup to clean up immediately if needed
+	performCleanup(database)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Cleanup Janitor stopping...")
+			return
+		case <-ticker.C:
+			performCleanup(database)
+		}
+	}
+}
+
+func performCleanup(database *db.DB) {
+	rows, err := database.DeleteOldSyncedJobs(7)
+	if err != nil {
+		log.Printf("Cleanup Janitor Error: %v", err)
+		return
+	}
+	if rows > 0 {
+		log.Printf("Cleanup Janitor: purged %d old synced jobs", rows)
+	}
+}
+</file>
+
+<file path="internal/engine/limiter.go">
+package engine
+
+import (
+	"sync"
+
+	"golang.org/x/time/rate"
+)
+
+// LimiterManager handles per-phone number rate limiting for multi-tenant isolation.
+type LimiterManager struct {
+	mu       sync.RWMutex
+	limiters map[string]*rate.Limiter
+}
+
+func NewLimiterManager() *LimiterManager {
+	return &LimiterManager{
+		limiters: make(map[string]*rate.Limiter),
+	}
+}
+
+// Allow checks if the request should be allowed based on tenant and phone number.
+// Uses double-checked locking for thread-safe limiter creation.
+func (m *LimiterManager) Allow(tenantID, phoneNumberID string) bool {
+	key := tenantID + ":" + phoneNumberID
+
+	m.mu.RLock()
+	limiter, exists := m.limiters[key]
+	m.mu.RUnlock()
+
+	if !exists {
+		m.mu.Lock()
+		// Double-check after acquiring write lock
+		limiter, exists = m.limiters[key]
+		if !exists {
+			// Meta's limit is ~80 msgs/sec, we use 75 for safety with a burst of 10.
+			limiter = rate.NewLimiter(75, 10)
+			m.limiters[key] = limiter
+		}
+		m.mu.Unlock()
+	}
+
+	return limiter.Allow()
+}
+</file>
+
+<file path="Caddyfile">
+api.bhejna.codenxtlab.tech {
+    reverse_proxy bhejna-api:8080
+}
+</file>
+
+<file path="public_api_docs.md">
+# Bhejna Public API Documentation
+
+Welcome to the Bhejna Messaging API. This documentation provides the technical specifications for integrating our high-reliability WhatsApp Cloud API infrastructure into your application.
+
+## Base URL
+
+All API requests should be made to:
+`https://api.bhejna.codenxtlab.tech`
+
+## Authentication
+
+Bhejna uses API keys to authenticate requests. You can view and manage your API keys in the Bhejna Dashboard.
+
+Your API key must be passed in the `Authorization` header as a Bearer token. All production keys start with the prefix `nxt_live_`.
+
+**Header:**
+`Authorization: Bearer nxt_live_xxxxxxxxxxxxxxxx`
+
+---
+
+## Send Message
+
+Dispatches a message to a recipient's WhatsApp number. This endpoint is asynchronous; a successful response indicates that the message has been validated and queued for delivery.
+
+### Endpoint
+`POST /v1/messages`
+
+### Request Headers
+| Header | Required | Description |
+| :--- | :--- | :--- |
+| `Authorization` | Yes | `Bearer <YOUR_API_KEY>` |
+| `Content-Type` | Yes | `application/json` |
+| `Idempotency-Key` | No | A unique string to prevent duplicate processing of the same request. |
+
+### Request Body
+The request body must be a JSON object with the following fields:
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `recipient` | string | The recipient's phone number in E.164 format (e.g., `15551234567`). |
+| `message_type` | string | The type of message being sent. Supported: `template`, `text`. |
+| `payload` | object | The message content object. This follows the standard WhatsApp Cloud API structure for the specified `message_type`. |
+
+#### Example: Template Message
+To send a template message, set `message_type` to `template` and provide the template details in the `payload`.
+
+```json
+{
+  "recipient": "15551234567",
+  "message_type": "template",
+  "payload": {
+    "name": "hello_world",
+    "language": {
+      "code": "en_US"
+    },
+    "components": [
+      {
+        "type": "body",
+        "parameters": [
+          {
+            "type": "text",
+            "text": "BarberBase"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Response Codes
+
+| Status Code | Description |
+| :--- | :--- |
+| `202 Accepted` | Message successfully queued. Returns a `job_id` for tracking. |
+| `400 Bad Request` | Invalid JSON payload or missing required fields. |
+| `401 Unauthorized` | Invalid or missing API key. |
+| `403 Forbidden` | Account is paused due to policy violations or limits. |
+| `429 Too Many Requests` | Rate limit exceeded for the sender. |
+
+### Example Response (`202 Accepted`)
+```json
+{
+  "job_id": "01H2X3Y4Z5W6V7U8T9S0R1Q2P3",
+  "status": "queued"
+}
+```
+
+---
+
+## Integration Snippet (cURL)
+
+```bash
+curl -X POST https://api.bhejna.codenxtlab.tech/v1/messages \
+  -H "Authorization: Bearer nxt_live_your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: unique_request_id_123" \
+  -d '{
+    "recipient": "15551234567",
+    "message_type": "template",
+    "payload": {
+      "name": "sample_template",
+      "language": { "code": "en_US" }
+    }
+  }'
+```
+</file>
+
+<file path="docs/public-api.md">
+# Bhejna Public API Reference
+
+Welcome to the Bhejna API documentation. Bhejna is a robust, high-throughput proxy for the WhatsApp Business Platform, designed for reliability, multi-tenancy, and developer experience.
+
+## Overview
+
+Bhejna acts as a delivery engine between your application and Meta's WhatsApp API. It handles:
+- **Queueing**: Safe message buffering.
+- **Retries**: Automatic handling of transient provider failures.
+- **Rate Limiting**: Per-tenant quota enforcement.
+- **Webhooks**: Consistent delivery receipts and inbound message forwarding.
+
+---
+
+## Quick Start
+
+### 1. Obtain an API Key
+Your API key is provided during tenant provisioning. Keep it secure.
+
+### 2. Send Your First Message
+```bash
+curl -X POST https://api.bhejna.com/v1/messages \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipient": "+1234567890",
+    "message_type": "text",
+    "payload": {
+      "body": "Hello from Bhejna!"
+    }
+  }'
+```
+
+### 3. Track Status
+Listen for webhooks at your configured `webhook_url` to receive delivery receipts (`sent`, `delivered`, `read`).
+
+---
+
+## Authentication
+
+All client requests must include the `X-API-Key` header.
+
+| Header | Value | Description |
+|---|---|---|
+| `X-API-Key` | `string` | Your unique tenant API key |
+
+---
+
+## API Conventions
+
+### JSON Standards
+All requests and responses use standard JSON. Timestamps are returned in ISO 8601 (UTC).
+
+### Request IDs
+Every response includes a `request_id`. Include this ID when contacting support.
+
+### Idempotency
+Bhejna supports idempotent requests via the `Idempotency-Key` header. If a request fails or times out, you can safely retry with the same key.
+
+---
+
+## Endpoints
+
+### POST `/v1/messages`
+
+**Purpose**: Enqueue a message for delivery.
+
+**Authentication**: Required (`X-API-Key`)
+
+**Headers**:
+- `Idempotency-Key`: (Optional) Unique string to prevent duplicate processing.
+
+**Request Body**:
+
+| Field | Type | Required | Description | Validation |
+|---|---|---|---|---|
+| `recipient` | `string` | Yes | Recipient phone number | E.164 format |
+| `message_type` | `string` | Yes | Type of message | See Enums |
+| `payload` | `object` | Yes | Meta-compatible payload | Max 64KB |
+
+**Message Types (Enums)**:
+`text`, `template`, `image`, `document`, `audio`, `video`, `sticker`, `location`, `contacts`, `interactive`
+
+**Example Request (TypeScript)**:
+```typescript
+const response = await fetch('https://api.bhejna.com/v1/messages', {
+  method: 'POST',
+  headers: {
+    'X-API-Key': 'YOUR_API_KEY',
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    recipient: '+1234567890',
+    message_type: 'text',
+    payload: { body: 'Hello!' }
+  })
+});
+```
+
+**Example Response (Success)**:
+```json
+{
+  "success": true,
+  "data": {
+    "job_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "status": "queued"
+  },
+  "request_id": "req_abc123"
+}
+```
+
+---
+
+## Lifecycle Semantics
+
+Messages move through the following states:
+
+1. **`queued`**: Message accepted by Bhejna and waiting in the worker pool.
+2. **`processing`**: Message being sent to Meta.
+3. **`sent`**: Meta has accepted the message.
+4. **`delivered`**: The message has reached the recipient's device.
+5. **`read`**: The recipient has opened the message.
+6. **`failed`**: Permanent failure (e.g., invalid number, provider error).
+
+---
+
+## Retry Semantics
+
+- **Transient Errors**: Bhejna automatically retries 5xx errors from Meta using exponential backoff.
+- **Validation Errors**: 4xx errors are considered non-retryable and marked as `failed`.
+- **Idempotency**: Requests with the same `Idempotency-Key` within 24 hours will return the existing `job_id` instead of creating a new one.
+</file>
+
+<file path="internal/api/generated/api.gen.go">
+//go:build go1.22
+
+// Package generated provides primitives to interact with the openapi HTTP API.
+//
+// Code generated by github.com/oapi-codegen/oapi-codegen/v2 version v2.7.0 DO NOT EDIT.
+package generated
+
+import (
+	"bytes"
+	"compress/flate"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/oapi-codegen/runtime"
+)
+
+const (
+	ApiKeyAuthScopes   apiKeyAuthContextKey   = "ApiKeyAuth.Scopes"
+	InternalAuthScopes internalAuthContextKey = "InternalAuth.Scopes"
+)
+
+// Defines values for MessageType.
+const (
+	Audio       MessageType = "audio"
+	Contacts    MessageType = "contacts"
+	Document    MessageType = "document"
+	Image       MessageType = "image"
+	Interactive MessageType = "interactive"
+	Location    MessageType = "location"
+	Sticker     MessageType = "sticker"
+	Template    MessageType = "template"
+	Text        MessageType = "text"
+	Video       MessageType = "video"
+)
+
+// Valid indicates whether the value is a known member of the MessageType enum.
+func (e MessageType) Valid() bool {
+	switch e {
+	case Audio:
+		return true
+	case Contacts:
+		return true
+	case Document:
+		return true
+	case Image:
+		return true
+	case Interactive:
+		return true
+	case Location:
+		return true
+	case Sticker:
+		return true
+	case Template:
+		return true
+	case Text:
+		return true
+	case Video:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SendMessageResponseStatus.
+const (
+	Queued SendMessageResponseStatus = "queued"
+)
+
+// Valid indicates whether the value is a known member of the SendMessageResponseStatus enum.
+func (e SendMessageResponseStatus) Valid() bool {
+	switch e {
+	case Queued:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebhookPayloadEntryChangesValueStatusesStatus.
+const (
+	Deleted   WebhookPayloadEntryChangesValueStatusesStatus = "deleted"
+	Delivered WebhookPayloadEntryChangesValueStatusesStatus = "delivered"
+	Failed    WebhookPayloadEntryChangesValueStatusesStatus = "failed"
+	Read      WebhookPayloadEntryChangesValueStatusesStatus = "read"
+	Sent      WebhookPayloadEntryChangesValueStatusesStatus = "sent"
+)
+
+// Valid indicates whether the value is a known member of the WebhookPayloadEntryChangesValueStatusesStatus enum.
+func (e WebhookPayloadEntryChangesValueStatusesStatus) Valid() bool {
+	switch e {
+	case Deleted:
+		return true
+	case Delivered:
+		return true
+	case Failed:
+		return true
+	case Read:
+		return true
+	case Sent:
+		return true
+	default:
+		return false
+	}
+}
+
+// ErrorResponse defines model for ErrorResponse.
+type ErrorResponse struct {
+	Error struct {
+		Code      string `json:"code"`
+		Message   string `json:"message"`
+		Retryable *bool  `json:"retryable,omitempty"`
+	} `json:"error"`
+	RequestId *string `json:"request_id,omitempty"`
+	Success   bool    `json:"success"`
+}
+
+// MessageType Allowed WhatsApp message types
+type MessageType string
+
+// SendMessageRequest defines model for SendMessageRequest.
+type SendMessageRequest struct {
+	// MessageType Allowed WhatsApp message types
+	MessageType MessageType `json:"message_type"`
+
+	// Payload Meta-compatible message payload
+	Payload map[string]interface{} `json:"payload"`
+
+	// Recipient E.164 formatted phone number (e.g., +1234567890)
+	Recipient string `json:"recipient"`
+}
+
+// SendMessageResponse defines model for SendMessageResponse.
+type SendMessageResponse struct {
+	JobId  string                    `json:"job_id"`
+	Status SendMessageResponseStatus `json:"status"`
+}
+
+// SendMessageResponseStatus defines model for SendMessageResponse.Status.
+type SendMessageResponseStatus string
+
+// SuccessResponse defines model for SuccessResponse.
+type SuccessResponse struct {
+	Data      *map[string]interface{} `json:"data,omitempty"`
+	RequestId *string                 `json:"request_id,omitempty"`
+	Success   bool                    `json:"success"`
+}
+
+// Tenant defines model for Tenant.
+type Tenant struct {
+	ApiKey         *string    `json:"api_key,omitempty"`
+	CreatedAt      *time.Time `json:"created_at,omitempty"`
+	Id             string     `json:"id"`
+	IsPaused       *bool      `json:"is_paused,omitempty"`
+	MessagingLimit *int       `json:"messaging_limit,omitempty"`
+	PhoneNumberId  string     `json:"phone_number_id"`
+	QualityRating  *string    `json:"quality_rating,omitempty"`
+	WabaId         string     `json:"waba_id"`
+	WebhookSecret  *string    `json:"webhook_secret,omitempty"`
+	WebhookUrl     *string    `json:"webhook_url,omitempty"`
+}
+
+// WebhookPayload defines model for WebhookPayload.
+type WebhookPayload struct {
+	Entry []struct {
+		Changes []struct {
+			Field string `json:"field"`
+			Value struct {
+				Messages *[]struct {
+					From *string `json:"from,omitempty"`
+					Id   *string `json:"id,omitempty"`
+					Text *struct {
+						Body *string `json:"body,omitempty"`
+					} `json:"text,omitempty"`
+					Timestamp *string `json:"timestamp,omitempty"`
+					Type      *string `json:"type,omitempty"`
+				} `json:"messages,omitempty"`
+				MessagingProduct *string `json:"messaging_product,omitempty"`
+				Metadata         *struct {
+					DisplayPhoneNumber *string `json:"display_phone_number,omitempty"`
+					PhoneNumberId      *string `json:"phone_number_id,omitempty"`
+				} `json:"metadata,omitempty"`
+				Statuses *[]struct {
+					Errors *[]struct {
+						Code  *int    `json:"code,omitempty"`
+						Title *string `json:"title,omitempty"`
+					} `json:"errors,omitempty"`
+					Id          *string                                        `json:"id,omitempty"`
+					RecipientId *string                                        `json:"recipient_id,omitempty"`
+					Status      *WebhookPayloadEntryChangesValueStatusesStatus `json:"status,omitempty"`
+					Timestamp   *string                                        `json:"timestamp,omitempty"`
+				} `json:"statuses,omitempty"`
+			} `json:"value"`
+		} `json:"changes"`
+
+		// Id WhatsApp Business Account ID
+		Id string `json:"id"`
+	} `json:"entry"`
+	Object string `json:"object"`
+}
+
+// WebhookPayloadEntryChangesValueStatusesStatus defines model for WebhookPayload.Entry.Changes.Value.Statuses.Status.
+type WebhookPayloadEntryChangesValueStatusesStatus string
+
+// apiKeyAuthContextKey is the context key for ApiKeyAuth security scheme
+type apiKeyAuthContextKey string
+
+// internalAuthContextKey is the context key for InternalAuth security scheme
+type internalAuthContextKey string
+
+// SyncTenantJSONBody defines parameters for SyncTenant.
+type SyncTenantJSONBody struct {
+	union json.RawMessage
+}
+
+// SyncTenantJSONBody1 defines parameters for SyncTenant.
+type SyncTenantJSONBody1 struct {
+	Record Tenant `json:"record"`
+}
+
+// SendMessageParams defines parameters for SendMessage.
+type SendMessageParams struct {
+	// IdempotencyKey Unique key to prevent duplicate message processing
+	IdempotencyKey *string `json:"Idempotency-Key,omitempty"`
+}
+
+// GetV1MetaWebhookParams defines parameters for GetV1MetaWebhook.
+type GetV1MetaWebhookParams struct {
+	HubMode        string `form:"hub.mode" json:"hub.mode"`
+	HubChallenge   string `form:"hub.challenge" json:"hub.challenge"`
+	HubVerifyToken string `form:"hub.verify_token" json:"hub.verify_token"`
+}
+
+// SyncTenantJSONRequestBody defines body for SyncTenant for application/json ContentType.
+type SyncTenantJSONRequestBody SyncTenantJSONBody
+
+// SendMessageJSONRequestBody defines body for SendMessage for application/json ContentType.
+type SendMessageJSONRequestBody = SendMessageRequest
+
+// PostV1MetaWebhookJSONRequestBody defines body for PostV1MetaWebhook for application/json ContentType.
+type PostV1MetaWebhookJSONRequestBody = WebhookPayload
+
+// AsTenant returns the union data inside the SyncTenantJSONBody as a Tenant
+func (t SyncTenantJSONBody) AsTenant() (Tenant, error) {
+	var body Tenant
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTenant overwrites any union data inside the SyncTenantJSONBody as the provided Tenant
+func (t *SyncTenantJSONBody) FromTenant(v Tenant) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTenant performs a merge with any union data inside the SyncTenantJSONBody, using the provided Tenant
+func (t *SyncTenantJSONBody) MergeTenant(v Tenant) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSyncTenantJSONBody1 returns the union data inside the SyncTenantJSONBody as a SyncTenantJSONBody1
+func (t SyncTenantJSONBody) AsSyncTenantJSONBody1() (SyncTenantJSONBody1, error) {
+	var body SyncTenantJSONBody1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSyncTenantJSONBody1 overwrites any union data inside the SyncTenantJSONBody as the provided SyncTenantJSONBody1
+func (t *SyncTenantJSONBody) FromSyncTenantJSONBody1(v SyncTenantJSONBody1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSyncTenantJSONBody1 performs a merge with any union data inside the SyncTenantJSONBody, using the provided SyncTenantJSONBody1
+func (t *SyncTenantJSONBody) MergeSyncTenantJSONBody1(v SyncTenantJSONBody1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t SyncTenantJSONBody) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *SyncTenantJSONBody) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// ServerInterface represents all server handlers.
+type ServerInterface interface {
+	// Sync or provision a tenant
+	// (POST /v1/internal/tenant)
+	SyncTenant(w http.ResponseWriter, r *http.Request)
+	// Pause a tenant
+	// (PUT /v1/internal/tenants/{id}/pause)
+	PauseTenant(w http.ResponseWriter, r *http.Request, id string)
+
+	// (POST /v1/internal/webhook-schema)
+	ForceGenerateWebhookType(w http.ResponseWriter, r *http.Request)
+	// Send a WhatsApp message
+	// (POST /v1/messages)
+	SendMessage(w http.ResponseWriter, r *http.Request, params SendMessageParams)
+	// Meta Webhook Verification
+	// (GET /v1/meta/webhook)
+	GetV1MetaWebhook(w http.ResponseWriter, r *http.Request, params GetV1MetaWebhookParams)
+	// Meta Webhook Payload Receiver
+	// (POST /v1/meta/webhook)
+	PostV1MetaWebhook(w http.ResponseWriter, r *http.Request)
+}
+
+// ServerInterfaceWrapper converts contexts to parameters.
+type ServerInterfaceWrapper struct {
+	Handler            ServerInterface
+	HandlerMiddlewares []MiddlewareFunc
+	ErrorHandlerFunc   func(w http.ResponseWriter, r *http.Request, err error)
+}
+
+type MiddlewareFunc func(http.Handler) http.Handler
+
+// SyncTenant operation middleware
+func (siw *ServerInterfaceWrapper) SyncTenant(w http.ResponseWriter, r *http.Request) {
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, InternalAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SyncTenant(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PauseTenant operation middleware
+func (siw *ServerInterfaceWrapper) PauseTenant(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, InternalAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PauseTenant(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ForceGenerateWebhookType operation middleware
+func (siw *ServerInterfaceWrapper) ForceGenerateWebhookType(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ForceGenerateWebhookType(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// SendMessage operation middleware
+func (siw *ServerInterfaceWrapper) SendMessage(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params SendMessageParams
+
+	headers := r.Header
+
+	// ------------- Optional header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = &IdempotencyKey
+
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SendMessage(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetV1MetaWebhook operation middleware
+func (siw *ServerInterfaceWrapper) GetV1MetaWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetV1MetaWebhookParams
+
+	// ------------- Required query parameter "hub.mode" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "hub.mode", r.URL.Query(), &params.HubMode, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "hub.mode"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "hub.mode", Err: err})
+		}
+		return
+	}
+
+	// ------------- Required query parameter "hub.challenge" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "hub.challenge", r.URL.Query(), &params.HubChallenge, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "hub.challenge"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "hub.challenge", Err: err})
+		}
+		return
+	}
+
+	// ------------- Required query parameter "hub.verify_token" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "hub.verify_token", r.URL.Query(), &params.HubVerifyToken, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "hub.verify_token"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "hub.verify_token", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetV1MetaWebhook(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostV1MetaWebhook operation middleware
+func (siw *ServerInterfaceWrapper) PostV1MetaWebhook(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostV1MetaWebhook(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+type UnescapedCookieParamError struct {
+	ParamName string
+	Err       error
+}
+
+func (e *UnescapedCookieParamError) Error() string {
+	return fmt.Sprintf("error unescaping cookie parameter '%s'", e.ParamName)
+}
+
+func (e *UnescapedCookieParamError) Unwrap() error {
+	return e.Err
+}
+
+type UnmarshalingParamError struct {
+	ParamName string
+	Err       error
+}
+
+func (e *UnmarshalingParamError) Error() string {
+	return fmt.Sprintf("Error unmarshaling parameter %s as JSON: %s", e.ParamName, e.Err.Error())
+}
+
+func (e *UnmarshalingParamError) Unwrap() error {
+	return e.Err
+}
+
+type RequiredParamError struct {
+	ParamName string
+}
+
+func (e *RequiredParamError) Error() string {
+	return fmt.Sprintf("Query argument %s is required, but not found", e.ParamName)
+}
+
+type RequiredHeaderError struct {
+	ParamName string
+	Err       error
+}
+
+func (e *RequiredHeaderError) Error() string {
+	return fmt.Sprintf("Header parameter %s is required, but not found", e.ParamName)
+}
+
+func (e *RequiredHeaderError) Unwrap() error {
+	return e.Err
+}
+
+type InvalidParamFormatError struct {
+	ParamName string
+	Err       error
+}
+
+func (e *InvalidParamFormatError) Error() string {
+	return fmt.Sprintf("Invalid format for parameter %s: %s", e.ParamName, e.Err.Error())
+}
+
+func (e *InvalidParamFormatError) Unwrap() error {
+	return e.Err
+}
+
+type TooManyValuesForParamError struct {
+	ParamName string
+	Count     int
+}
+
+func (e *TooManyValuesForParamError) Error() string {
+	return fmt.Sprintf("Expected one value for %s, got %d", e.ParamName, e.Count)
+}
+
+// Handler creates http.Handler with routing matching OpenAPI spec.
+func Handler(si ServerInterface) http.Handler {
+	return HandlerWithOptions(si, StdHTTPServerOptions{})
+}
+
+// ServeMux is an abstraction of [http.ServeMux].
+type ServeMux interface {
+	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
+	http.Handler
+}
+
+type StdHTTPServerOptions struct {
+	BaseURL          string
+	BaseRouter       ServeMux
+	Middlewares      []MiddlewareFunc
+	ErrorHandlerFunc func(w http.ResponseWriter, r *http.Request, err error)
+}
+
+// HandlerFromMux creates http.Handler with routing matching OpenAPI spec based on the provided mux.
+func HandlerFromMux(si ServerInterface, m ServeMux) http.Handler {
+	return HandlerWithOptions(si, StdHTTPServerOptions{
+		BaseRouter: m,
+	})
+}
+
+func HandlerFromMuxWithBaseURL(si ServerInterface, m ServeMux, baseURL string) http.Handler {
+	return HandlerWithOptions(si, StdHTTPServerOptions{
+		BaseURL:    baseURL,
+		BaseRouter: m,
+	})
+}
+
+// HandlerWithOptions creates http.Handler with additional options
+func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.Handler {
+	m := options.BaseRouter
+
+	if m == nil {
+		m = http.NewServeMux()
+	}
+	if options.ErrorHandlerFunc == nil {
+		options.ErrorHandlerFunc = func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+	}
+
+	wrapper := ServerInterfaceWrapper{
+		Handler:            si,
+		HandlerMiddlewares: options.Middlewares,
+		ErrorHandlerFunc:   options.ErrorHandlerFunc,
+	}
+
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/internal/tenant", wrapper.SyncTenant)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/internal/tenants/{id}/pause", wrapper.PauseTenant)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/internal/webhook-schema", wrapper.ForceGenerateWebhookType)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/messages", wrapper.SendMessage)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/meta/webhook", wrapper.GetV1MetaWebhook)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/meta/webhook", wrapper.PostV1MetaWebhook)
+
+	return m
+}
+
+type SyncTenantRequestObject struct {
+	Body *SyncTenantJSONRequestBody
+}
+
+type SyncTenantResponseObject interface {
+	VisitSyncTenantResponse(w http.ResponseWriter) error
+}
+
+type SyncTenant200Response struct {
+}
+
+func (response SyncTenant200Response) VisitSyncTenantResponse(w http.ResponseWriter) error {
+	w.WriteHeader(200)
+	return nil
+}
+
+type PauseTenantRequestObject struct {
+	Id string `json:"id"`
+}
+
+type PauseTenantResponseObject interface {
+	VisitPauseTenantResponse(w http.ResponseWriter) error
+}
+
+type PauseTenant204Response struct {
+}
+
+func (response PauseTenant204Response) VisitPauseTenantResponse(w http.ResponseWriter) error {
+	w.WriteHeader(204)
+	return nil
+}
+
+type ForceGenerateWebhookTypeRequestObject struct {
+}
+
+type ForceGenerateWebhookTypeResponseObject interface {
+	VisitForceGenerateWebhookTypeResponse(w http.ResponseWriter) error
+}
+
+type ForceGenerateWebhookType200JSONResponse WebhookPayload
+
+func (response ForceGenerateWebhookType200JSONResponse) VisitForceGenerateWebhookTypeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SendMessageRequestObject struct {
+	Params SendMessageParams
+	Body   *SendMessageJSONRequestBody
+}
+
+type SendMessageResponseObject interface {
+	VisitSendMessageResponse(w http.ResponseWriter) error
+}
+
+type SendMessage202JSONResponse struct {
+	Data      *SendMessageResponse `json:"data,omitempty"`
+	RequestId *string              `json:"request_id,omitempty"`
+	Success   bool                 `json:"success"`
+}
+
+func (response SendMessage202JSONResponse) VisitSendMessageResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(202)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SendMessage400JSONResponse ErrorResponse
+
+func (response SendMessage400JSONResponse) VisitSendMessageResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SendMessage401Response struct {
+}
+
+func (response SendMessage401Response) VisitSendMessageResponse(w http.ResponseWriter) error {
+	w.WriteHeader(401)
+	return nil
+}
+
+type SendMessage429Response struct {
+}
+
+func (response SendMessage429Response) VisitSendMessageResponse(w http.ResponseWriter) error {
+	w.WriteHeader(429)
+	return nil
+}
+
+type GetV1MetaWebhookRequestObject struct {
+	Params GetV1MetaWebhookParams
+}
+
+type GetV1MetaWebhookResponseObject interface {
+	VisitGetV1MetaWebhookResponse(w http.ResponseWriter) error
+}
+
+type GetV1MetaWebhook200TextResponse string
+
+func (response GetV1MetaWebhook200TextResponse) VisitGetV1MetaWebhookResponse(w http.ResponseWriter) error {
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(200)
+
+	_, err := w.Write([]byte(response))
+	return err
+}
+
+type GetV1MetaWebhook403Response struct {
+}
+
+func (response GetV1MetaWebhook403Response) VisitGetV1MetaWebhookResponse(w http.ResponseWriter) error {
+	w.WriteHeader(403)
+	return nil
+}
+
+type PostV1MetaWebhookRequestObject struct {
+	Body *PostV1MetaWebhookJSONRequestBody
+}
+
+type PostV1MetaWebhookResponseObject interface {
+	VisitPostV1MetaWebhookResponse(w http.ResponseWriter) error
+}
+
+type PostV1MetaWebhook200Response struct {
+}
+
+func (response PostV1MetaWebhook200Response) VisitPostV1MetaWebhookResponse(w http.ResponseWriter) error {
+	w.WriteHeader(200)
+	return nil
+}
+
+// StrictServerInterface represents all server handlers.
+type StrictServerInterface interface {
+	// Sync or provision a tenant
+	// (POST /v1/internal/tenant)
+	SyncTenant(ctx context.Context, request SyncTenantRequestObject) (SyncTenantResponseObject, error)
+	// Pause a tenant
+	// (PUT /v1/internal/tenants/{id}/pause)
+	PauseTenant(ctx context.Context, request PauseTenantRequestObject) (PauseTenantResponseObject, error)
+
+	// (POST /v1/internal/webhook-schema)
+	ForceGenerateWebhookType(ctx context.Context, request ForceGenerateWebhookTypeRequestObject) (ForceGenerateWebhookTypeResponseObject, error)
+	// Send a WhatsApp message
+	// (POST /v1/messages)
+	SendMessage(ctx context.Context, request SendMessageRequestObject) (SendMessageResponseObject, error)
+	// Meta Webhook Verification
+	// (GET /v1/meta/webhook)
+	GetV1MetaWebhook(ctx context.Context, request GetV1MetaWebhookRequestObject) (GetV1MetaWebhookResponseObject, error)
+	// Meta Webhook Payload Receiver
+	// (POST /v1/meta/webhook)
+	PostV1MetaWebhook(ctx context.Context, request PostV1MetaWebhookRequestObject) (PostV1MetaWebhookResponseObject, error)
+}
+
+type StrictHandlerFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error)
+type StrictMiddlewareFunc func(f StrictHandlerFunc, operationID string) StrictHandlerFunc
+
+type StrictHTTPServerOptions struct {
+	RequestErrorHandlerFunc  func(w http.ResponseWriter, r *http.Request, err error)
+	ResponseErrorHandlerFunc func(w http.ResponseWriter, r *http.Request, err error)
+}
+
+func NewStrictHandler(ssi StrictServerInterface, middlewares []StrictMiddlewareFunc) ServerInterface {
+	return &strictHandler{ssi: ssi, middlewares: middlewares, options: StrictHTTPServerOptions{
+		RequestErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		},
+		ResponseErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		},
+	}}
+}
+
+func NewStrictHandlerWithOptions(ssi StrictServerInterface, middlewares []StrictMiddlewareFunc, options StrictHTTPServerOptions) ServerInterface {
+	return &strictHandler{ssi: ssi, middlewares: middlewares, options: options}
+}
+
+type strictHandler struct {
+	ssi         StrictServerInterface
+	middlewares []StrictMiddlewareFunc
+	options     StrictHTTPServerOptions
+}
+
+// SyncTenant operation middleware
+func (sh *strictHandler) SyncTenant(w http.ResponseWriter, r *http.Request) {
+	var request SyncTenantRequestObject
+
+	var body SyncTenantJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SyncTenant(ctx, request.(SyncTenantRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SyncTenant")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SyncTenantResponseObject); ok {
+		if err := validResponse.VisitSyncTenantResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PauseTenant operation middleware
+func (sh *strictHandler) PauseTenant(w http.ResponseWriter, r *http.Request, id string) {
+	var request PauseTenantRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PauseTenant(ctx, request.(PauseTenantRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PauseTenant")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PauseTenantResponseObject); ok {
+		if err := validResponse.VisitPauseTenantResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ForceGenerateWebhookType operation middleware
+func (sh *strictHandler) ForceGenerateWebhookType(w http.ResponseWriter, r *http.Request) {
+	var request ForceGenerateWebhookTypeRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ForceGenerateWebhookType(ctx, request.(ForceGenerateWebhookTypeRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ForceGenerateWebhookType")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ForceGenerateWebhookTypeResponseObject); ok {
+		if err := validResponse.VisitForceGenerateWebhookTypeResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// SendMessage operation middleware
+func (sh *strictHandler) SendMessage(w http.ResponseWriter, r *http.Request, params SendMessageParams) {
+	var request SendMessageRequestObject
+
+	request.Params = params
+
+	var body SendMessageJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SendMessage(ctx, request.(SendMessageRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SendMessage")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SendMessageResponseObject); ok {
+		if err := validResponse.VisitSendMessageResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetV1MetaWebhook operation middleware
+func (sh *strictHandler) GetV1MetaWebhook(w http.ResponseWriter, r *http.Request, params GetV1MetaWebhookParams) {
+	var request GetV1MetaWebhookRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetV1MetaWebhook(ctx, request.(GetV1MetaWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetV1MetaWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetV1MetaWebhookResponseObject); ok {
+		if err := validResponse.VisitGetV1MetaWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PostV1MetaWebhook operation middleware
+func (sh *strictHandler) PostV1MetaWebhook(w http.ResponseWriter, r *http.Request) {
+	var request PostV1MetaWebhookRequestObject
+
+	var body PostV1MetaWebhookJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PostV1MetaWebhook(ctx, request.(PostV1MetaWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PostV1MetaWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PostV1MetaWebhookResponseObject); ok {
+		if err := validResponse.VisitPostV1MetaWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// Base64 encoded, compressed with deflate, json marshaled OpenAPI spec.
+// Stored as a slice of fixed-width chunks rather than one concatenated
+// const string: with thousands of chunks the chained `+` fold is several
+// times slower for the Go compiler than parsing a slice literal.
+var swaggerSpec = []string{
+	"vFhfc9u4Ef8qKHoPd3O0ZMdJrtFLR2ninJpL4rMTp9PY1UDESkJMAjQAymY9+u6dBUBSIiFbl7vrk2UC",
+	"WOyf3+7+Fvc0VXmhJEhr6OiemnQJOXM/X2ut9BmYQkkD+KHQqgBtBbhlwOX+51RxtxnuWF5kQEd08v5i",
+	"/Mvk1fT05w/vX9OE2qrAz8ZqIRd0ndAcjGGLzqkzSEUhQFpSLJUEIst8BpoIuWKZ4DExGqyu2CzbFjRn",
+	"mYFm90ypDJika7f/phQaOB198Vq3mlw1B9TsK6SWhu1g7FTwbUU13EyPnhzHNDJlmoIx36BPfTIJbo4p",
+	"9M4r+9F9v6ccTKpFYYWSdETHWaZugZPPS2bNuChIMI2gGCdXljneZOHOou6QFxmz6ASRowsSylVa5iBx",
+	"lZVcKJrQleCAf40V6TVomtBMpcxdmdBUSctSi8KFtKBZasVq05etY85B8qD+mXdrH0hB4akN9n2nYU5H",
+	"9K/DFrDDgNbhpivWCS1YlSnG+155B5Yd4HlmxSyDxin1gaSN0z2dKV7REf0ZskwlxC6FIcIQRiwY25yc",
+	"a5WTl0v4Ktlf8OoIbAKO+9q8Hhw9f0rmSufMWuDbQP8eBotBQn48enL89Nnzn/724vCHTfXoxgJFi60F",
+	"jUL/c3n5498vL/n9T8nRs/V3fVh2kNbql2y7vHVjDHxbEdxVIr6qWS9dDo/GZ/8+fv/q9duP5xdPz85O",
+	"Tn59/uLNs5PxRTSDLLOlT6CA15sSSuARVHXsCnc3IqJG+CzbbQBnluHfP6sYWF3uXwtiFnwEyWQkeVgh",
+	"ptdQbejeKpJqYBb4lLlzHn50hLbCgRU5xJT3dvY/m2nBSgObq40ZNZ6EXEwzkQu7sQkLxAK0S1ZE/dSj",
+	"frrjnpuSZcJWU80sfoltuWUztuv4LcyWSl1PDaQa7INbSp1F1jsRcbiqL+xbEAvUZy//tK1MnW4qrXbh",
+	"EhZyE2mrSyYX/ueOHXMBWQeNIZ9NLKIrlpWws+o+eJFWeRwNce+7DtOT4qtrzNM93yEojWV5ERcf+sM+",
+	"gvwHpjWrtvFZaMXL1G677xZ7JyuKOGexrK4OnZohTJGxarqJiqjijwM/ZoMvZw8GyFGGhzbUHK2fjFbY",
+	"7Fu9uSP8TYPZlZ39Gm98O+KQiRVgzqEU157nTGTufw4Z2GgfeBgvjxvS39HJfp9odQZd7e2Z7ebfELOX",
+	"pRESjCHjNFWltGTy6tGm7cpOXRL20SCsROE9nQUNpsxr8Oj1QVoSqtZVzGMG0lILW50jRfOwGxfiLVTj",
+	"0i4dNtELS2Dc8UjJchTwr4Px6eTgLVStDsydQiMmyColy2oJM2Aa9EndwP75+SO2e3cf9iG32spZWlvQ",
+	"Naom5Fz5NHCEFX+G6/+hOLy/s+QXNqMJdb3AnTOj4RCTRt7ZjM0GqcpRn+2AehLoKeJSLJYHBWjXXGUK",
+	"XRou5IIUWt1VhElOAs4rAnIhJAzIpZxYXEe6jeJQUaTTB3OhjSXj0wmyRmJAcpRU1+yE4K5r/NSI9MmV",
+	"uHs0pCBWuCzkTJWSNyfJSjASWqAZXCKbD5WgNmt8OkHIgzbe2qPB4eDQIasAyQpBR/R4cDg49lx06eI9",
+	"XB0NRYjZ0LZMRZkIGa6DS0DyQglpiVXeB3gjUZqUBVIU4gWhT+ZiUWo3fQyoU8T/M+F0RM8rmQZy1LC1",
+	"l6HloDsDIWdFkQk/wQy/GlSkHoHxl5LwYU5HXx4ePsI166RbZjWkSvPHZpf6eJ+X4+F+bl2tt7cih3Qf",
+	"PIl1Nz85POx72F9ETCVT4CSwynmZZdVWwjp7t1Pty9X6CglsnjMkKc65GJE2PCyEBYHDFgYNqEXQK5Qe",
+	"wYIZ3gu+HjoC6XBRRmDxjsmSZVlF3LZm7GrwjXlQX95HwSkeamBQMM1ysIC98UsoQAjWtvwITruuTTbw",
+	"0K2KVz23P93pds+Tf5fbnTW/0dUhqQ9aIx5JP7NkXN1uZeFc6RTIAmRwLVFzss1n3atC3/0nePCNPwfh",
+	"xEc/W8bgundePpROHaLtkmXb1A9v8Wtw1CbfjXvmtXQjJ9bhZuhXukUgls66vEfqUDsn9xG4fdEnKW5K",
+	"INdQ+dIHK5CW8NJ7YuOxQiuEEEIwiXfRCYe8UBZkWoVe+giGv608PhSGyAvPXnXryW/SgGXZHgW6O+b3",
+	"K3XN5Pe2qJa03lGeu89OPnIsTaGwwF03Dg8Z64Q+/QPhv/1oG9Fl4h9Qia6jgvcf9WH/SbLSLpUW/w1K",
+	"PnnR3/RrqSwjcJcCcNzWrWebjK/XREBywnoPlBtl7V2dm1dttlpWlzTUZuGn+e2UewP24ugdWBZKwY7K",
+	"f1OCrtqcWZazQe5fgfdvAMluWemSZRnIxR8mcAVazKupVdcgf2eX6sINJ/RhkTHRAVpXUrSUIn6O+9A4",
+	"UXomOAf/ntWGHQNTdw9ygTaJ5gW5DnxYxsAnTVXudHZlelH+M+pYrJ18A/dyPWenG+oueuYIuh9a+q7w",
+	"2aVX8e5x6l8wsD2fu029AYYVYjBzbN4PMFfNLTtn0x7daoJgWnA2aYro3RZ0XhkLOWE8F1IYG+gDVj/j",
+	"KGREWsNl+tImYWrpDDdOXq2pHxI25DUORHvrEccHyEuZ+iO7CcA5tuHbJcgNBhBuDiM4+d6AtAlpHiwS",
+	"ooHxhPjnih/6tGDJJM/gVVDhk9fg/4XgvRBbY9MPjXVxb/D7qhODsjYhCtz1/wIAAP//",
+}
+
+// decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,
+// after base64-decoding and flate-decompressing the embedded blob.
+func decodeSpec() ([]byte, error) {
+	encoded := strings.Join(swaggerSpec, "")
+	compressed, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("error base64 decoding spec: %w", err)
+	}
+	zr := flate.NewReader(bytes.NewReader(compressed))
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(zr); err != nil {
+		return nil, fmt.Errorf("read flate: %w", err)
+	}
+	if err := zr.Close(); err != nil {
+		return nil, fmt.Errorf("close flate reader: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+var rawSpec = decodeSpecCached()
+
+// a naive cache of the decoded OpenAPI spec
+func decodeSpecCached() func() ([]byte, error) {
+	data, err := decodeSpec()
+	return func() ([]byte, error) {
+		return data, err
+	}
+}
+
+// Constructs a synthetic filesystem for resolving external references when loading openapi specifications.
+func PathToRawSpec(pathToFile string) map[string]func() ([]byte, error) {
+	res := make(map[string]func() ([]byte, error))
+	if len(pathToFile) > 0 {
+		res[pathToFile] = rawSpec
+	}
+
+	return res
+}
+
+// GetSpec returns the OpenAPI specification corresponding to the generated
+// code in this file. External references in the spec are resolved through
+// PathToRawSpec; externally-referenced files must be embedded in their
+// corresponding Go packages (via the import-mapping feature). URL-based
+// external refs are not supported.
+func GetSpec() (swagger *openapi3.T, err error) {
+	resolvePath := PathToRawSpec("")
+
+	loader := openapi3.NewLoader()
+	loader.IsExternalRefsAllowed = true
+	loader.ReadFromURIFunc = func(loader *openapi3.Loader, url *url.URL) ([]byte, error) {
+		pathToFile := url.String()
+		pathToFile = path.Clean(pathToFile)
+		getSpec, ok := resolvePath[pathToFile]
+		if !ok {
+			err1 := fmt.Errorf("path not found: %s", pathToFile)
+			return nil, err1
+		}
+		return getSpec()
+	}
+	var specData []byte
+	specData, err = rawSpec()
+	if err != nil {
+		return
+	}
+	swagger, err = loader.LoadFromData(specData)
+	if err != nil {
+		return
+	}
+	return
+}
+
+// GetSpecJSON returns the raw JSON bytes of the embedded OpenAPI
+// specification: decompressed but not unmarshaled. External references
+// are not resolved here; the bytes are the spec exactly as embedded by
+// codegen. The result is cached at package init time, so repeated calls
+// are cheap.
+func GetSpecJSON() ([]byte, error) {
+	return rawSpec()
+}
+
+// GetSwagger returns the OpenAPI specification corresponding to the
+// generated code in this file.
+//
+// Deprecated: GetSwagger predates kin-openapi renaming openapi3.Swagger
+// to openapi3.T. Use [GetSpec] instead. This wrapper is retained for
+// backwards compatibility.
+func GetSwagger() (*openapi3.T, error) {
+	return GetSpec()
+}
+</file>
+
+<file path="internal/api/middleware.go">
+package api
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+type contextKey string
+
+const tenantKey contextKey = "tenant"
+
+// APIKeyMiddleware extracts the Authorization: Bearer <key> header and looks up the tenant.
+func APIKeyMiddleware(database *db.DB) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+				http.Error(w, "Unauthorized: Missing or invalid API key", http.StatusUnauthorized)
+				return
+			}
+
+			key := strings.TrimPrefix(authHeader, "Bearer ")
+			tenant, err := database.GetTenantByAccessToken(key)
+			if err != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			if tenant == nil {
+				http.Error(w, "Unauthorized: Invalid API key", http.StatusUnauthorized)
+				return
+			}
+
+			if tenant.IsPaused {
+				http.Error(w, "Forbidden: Tenant account is paused", http.StatusForbidden)
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), tenantKey, tenant)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// MetaSignatureMiddleware validates the X-Hub-Signature-256 header.
+func MetaSignatureMiddleware(appSecret string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Cap Meta webhook bodies at 1MB to prevent OOM from oversized payloads
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+			signature := r.Header.Get("X-Hub-Signature-256")
+			if signature == "" {
+				http.Error(w, "Unauthorized: Missing signature", http.StatusUnauthorized)
+				return
+			}
+
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+			// Restore the body for subsequent handlers
+			r.Body = io.NopCloser(bytes.NewBuffer(body))
+
+			if !validateSignature(body, signature, appSecret) {
+				http.Error(w, "Unauthorized: Invalid signature", http.StatusUnauthorized)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// InternalJWTMiddleware protects internal routes with a shared secret.
+func InternalJWTMiddleware(jwtSecret string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+				http.Error(w, "Unauthorized: Missing token", http.StatusUnauthorized)
+				return
+			}
+
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+			if token != jwtSecret {
+				http.Error(w, "Unauthorized: Invalid token", http.StatusUnauthorized)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func validateSignature(payload []byte, signature string, secret string) bool {
+	if !strings.HasPrefix(signature, "sha256=") {
+		return false
+	}
+
+	actualSig := signature[7:]
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write(payload)
+	expectedSig := hex.EncodeToString(h.Sum(nil))
+
+	return hmac.Equal([]byte(actualSig), []byte(expectedSig))
+}
+
+func GetTenant(ctx context.Context) *db.Tenant {
+	if tenant, ok := ctx.Value(tenantKey).(*db.Tenant); ok {
+		return tenant
+	}
+	return nil
+}
+</file>
+
+<file path="internal/engine/janitor.go">
+package engine
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+// StartJanitor runs background maintenance tasks.
+func StartJanitor(ctx context.Context, database *db.DB) {
+	ticker1 := time.NewTicker(1 * time.Minute)
+	ticker2 := time.NewTicker(15 * time.Minute)
+
+	defer ticker1.Stop()
+	defer ticker2.Stop()
+
+	log.Println("Janitor: started background reconciliation")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Janitor: stopping")
+			return
+		case <-ticker1.C:
+			// Ticker 1: Park & Sweep (Every 1 min)
+			// Selects unmatched webhook events and tries to reconcile them with jobs.
+			parkAndSweep(database)
+		case <-ticker2.C:
+			// Ticker 2: Stale Detector (Every 15 mins)
+			// Alerts for jobs stuck in 'accepted' status for too long.
+			staleDetector(database)
+		}
+	}
+}
+
+func parkAndSweep(database *db.DB) {
+	events, err := database.GetUnmatchedEvents()
+	if err != nil {
+		log.Printf("Janitor: error fetching unmatched events: %v", err)
+		return
+	}
+
+	for _, event := range events {
+		// Attempt to reconcile the event with a job
+		// Note: In Phase 3, we'll implement a proper webhook parser.
+		wamid, status, level := parseWebhookDummy(event.RawPayload)
+		if wamid == "" {
+			continue
+		}
+
+		success, err := database.UpdateJobMonotonic(wamid, status, level)
+		if err != nil {
+			log.Printf("Janitor: error updating job %s: %v", wamid, err)
+			continue
+		}
+
+		if success {
+			_ = database.MarkEventMatched(event.ID)
+		}
+	}
+}
+
+func staleDetector(database *db.DB) {
+	staleJobs, err := database.GetStaleJobs(15 * time.Minute)
+	if err != nil {
+		log.Printf("Janitor: error checking stale jobs: %v", err)
+		return
+	}
+
+	for _, job := range staleJobs {
+		log.Printf("ALERT: Stale job detected! ID: %s, Tenant: %s, Last Update: %v",
+			job.ID, job.TenantID, job.UpdatedAt)
+	}
+}
+
+func parseWebhookDummy(_ string) (string, string, int) {
+	// Placeholder for real webhook parsing logic
+	return "", "", 0
+}
+</file>
+
+<file path=".gitignore">
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+.env*
+# Editor/IDE
+# .idea/
+# .vscode/
+</file>
+
+<file path="docker-compose.yml">
+version: '3.8'
+
+services:
+  bhejna-api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /opt/bhejna/data:/app/data
+    environment:
+      - DB_PATH=/app/data/bhejna.db
+    env_file:
+      - .env
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - bhejna-api
+
+volumes:
+  caddy_data:
+  caddy_config:
+</file>
+
+<file path="README.md">
+# Bhejna Backend: WhatsApp Cloud API Proxy
+
+Bhejna is a high-performance Go-based proxy for the WhatsApp Cloud API (Meta). It features a local SQLite queue for edge reliability and an asynchronous synchronization engine for Supabase.
+
+## Architecture Overview
+
+The system follows a "Queue-First" architecture to ensure zero message loss even during Meta API outages or rate-limiting events.
+
+1.  **SvelteKit -> Go Router**: The frontend (Dashboard) or external clients send requests to the Go backend.
+2.  **Go Router -> SQLite Queue**: Incoming messages are validated and immediately persisted into the local SQLite `jobs` table.
+3.  **SQLite Queue -> Go Worker**: A pool of background workers (Meta Dispatchers) continuously poll the SQLite database for new jobs.
+4.  **Go Worker -> Meta API**: The worker reconstructs the Meta JSON envelope and dispatches the request to the WhatsApp Cloud API using a System User Token.
+5.  **Supabase Sync Worker**: A separate background process periodically syncs terminal job states (Success/Failure) and tenant updates back to the central Supabase database.
+
+### Database & Schema
+- **SQLite with WAL Mode**: The backend uses SQLite in Write-Ahead Logging (WAL) mode. This allows for concurrent readers while maintaining a single serial writer, preventing "database is locked" errors under load.
+- **Embedded Schema**: The database schema is embedded directly into the Go binary using `go:embed`. It is automatically applied on startup, ensuring the edge database is always in the correct state.
+
+## Environment Variables
+
+Create a `.env` file in the root directory with the following variables:
+
+| Variable | Description | Example |
+| :--- | :--- | :--- |
+| `PORT` | Port the server listens on | `8080` |
+| `DB_PATH` | Path to the SQLite database file | `bhejna.db` |
+| `INTERNAL_SECRET` | Secret used for internal control-plane routes | `your_high_entropy_secret` |
+| `SUPABASE_URL` | Your Supabase project URL | `https://xyz.supabase.co` |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase Service Role Key (Required for sync) | `eyJhbGci...` |
+| `META_APP_SECRET` | Meta App Secret (for webhook verification) | `abcdef123...` |
+| `META_VERIFY_TOKEN` | Meta Webhook Verify Token | `your_secure_verify_token` |
+| `META_SYSTEM_USER_TOKEN` | Global Meta System User Token (Optional fallback) | `EAAWq...` |
+
+## Internal Routing
+
+### `POST /v1/internal/tenant`
+Used to synchronize tenant provisioning (API Keys, Phone IDs) from the control plane (SvelteKit/Supabase) to the local edge database.
+
+**Authentication:**
+The endpoint accepts authentication via two methods:
+1.  **Header**: `Authorization: Bearer <INTERNAL_SECRET>`
+2.  **Body**: `{ "system_token": "<INTERNAL_SECRET>" }`
+
+**Payload Examples:**
+- **SvelteKit Direct**: `{ "tenant_id": "uuid", "api_key": "sb_...", "phone_number_id": "123" }`
+- **Supabase Webhook**: `{ "record": { "id": "uuid", "api_key": "sb_...", ... } }`
+
+## Worker Processes
+
+### 1. Meta Dispatcher
+The primary worker responsible for message delivery.
+- **Envelope Construction**: It wraps the internal payload into the official Meta format (adding `messaging_product: "whatsapp"`, `to`, and `type`).
+- **Error Handling**: 
+    - **Transient (5xx)**: Automatically requeues the job with a randomized jitter.
+    - **Policy (400/Limit)**: Fails the job and automatically **pauses the tenant** to prevent further account risk.
+- **Status Monotonicity**: Ensures statuses like `accepted`, `delivered`, and `read` are updated in order.
+
+### 2. Supabase Sync Worker
+An asynchronous task that reconciles the edge state with the central database.
+- **Schema**: Maps the SQLite `jobs` table to the Supabase `jobs_analytics` table.
+- **Frequency**: Runs every 5 minutes (default) to batch-upload terminal states.
+- **Requirement**: Requires `SUPABASE_SERVICE_ROLE_KEY` to bypass RLS for analytical writes.
+
+## Running Locally
+
+To run the Bhejna server in development mode:
+
+```bash
+# Using go run
+go run cmd/bhejna/main.go
+
+# Or build and run
+go build -o bhejna cmd/bhejna/main.go
+./bhejna
+```
+
+The server will automatically load variables from the `.env` file in the current working directory.
+</file>
+
+<file path="docs/openapi.yaml">
+openapi: 3.0.3
+info:
+  title: Bhejna API
+  description: |
+    Bhejna is a high-performance WhatsApp messaging proxy and delivery engine. 
+    It provides a contract-first API for sending messages, tracking delivery status, and receiving inbound messages via webhooks.
+  version: 1.0.0
+  contact:
+    name: CodeNxt Lab
+    url: https://codenxtlab.com
+
+servers:
+  - url: https://api.bhejna.com
+    description: Production Server
+
+tags:
+  - name: Messages
+    description: WhatsApp message delivery operations
+  - name: Internal
+    description: System administration and sync operations
+  - name: Webhooks
+    description: Inbound delivery status and message updates
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    InternalAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    MessageType:
+      type: string
+      enum: [text, template, image, document, audio, video, sticker, location, contacts, interactive]
+      description: Allowed WhatsApp message types
+
+    SendMessageRequest:
+      type: object
+      required:
+        - recipient
+        - message_type
+        - payload
+      properties:
+        recipient:
+          type: string
+          description: "E.164 formatted phone number (e.g., +1234567890)"
+          pattern: '^\+?\d{7,15}$'
+          example: "+1234567890"
+        message_type:
+          $ref: '#/components/schemas/MessageType'
+        payload:
+          type: object
+          description: "Meta-compatible message payload"
+          example:
+            body: "Hello, this is a test message from Bhejna!"
+
+    SendMessageResponse:
+      type: object
+      required:
+        - job_id
+        - status
+      properties:
+        job_id:
+          type: string
+          example: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        status:
+          type: string
+          enum: [queued]
+
+    Tenant:
+      type: object
+      required:
+        - id
+        - waba_id
+        - phone_number_id
+      properties:
+        id:
+          type: string
+        waba_id:
+          type: string
+        phone_number_id:
+          type: string
+        api_key:
+          type: string
+        messaging_limit:
+          type: integer
+        quality_rating:
+          type: string
+        is_paused:
+          type: boolean
+        webhook_url:
+          type: string
+        webhook_secret:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    SuccessResponse:
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+        request_id:
+          type: string
+          example: "req_123"
+
+    ErrorResponse:
+      type: object
+      required:
+        - success
+        - error
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              example: "INVALID_PHONE"
+            message:
+              type: string
+              example: "Recipient phone number invalid"
+            retryable:
+              type: boolean
+              example: false
+        request_id:
+          type: string
+          example: "req_123"
+
+    WebhookPayload:
+      type: object
+      required:
+        - object
+        - entry
+      properties:
+        object:
+          type: string
+          example: "whatsapp_business_account"
+        entry:
+          type: array
+          items:
+            type: object
+            required:
+              - id
+              - changes
+            properties:
+              id:
+                type: string
+                description: "WhatsApp Business Account ID"
+              changes:
+                type: array
+                items:
+                  type: object
+                  required:
+                    - field
+                    - value
+                  properties:
+                    field:
+                      type: string
+                      example: "messages"
+                    value:
+                      type: object
+                      properties:
+                        messaging_product:
+                          type: string
+                          example: "whatsapp"
+                        metadata:
+                          type: object
+                          properties:
+                            display_phone_number:
+                              type: string
+                            phone_number_id:
+                              type: string
+                        statuses:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: string
+                              status:
+                                type: string
+                                enum: [sent, delivered, read, failed, deleted]
+                              timestamp:
+                                type: string
+                              recipient_id:
+                                type: string
+                              errors:
+                                type: array
+                                items:
+                                  type: object
+                                  properties:
+                                    code:
+                                      type: integer
+                                    title:
+                                      type: string
+                        messages:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              from:
+                                type: string
+                              id:
+                                type: string
+                              timestamp:
+                                type: string
+                              type:
+                                type: string
+                              text:
+                                type: object
+                                properties:
+                                  body:
+                                    type: string
+
+paths:
+  /v1/meta/webhook:
+    get:
+      operationId: GetV1MetaWebhook
+      tags:
+        - Webhooks
+      summary: Meta Webhook Verification
+      parameters:
+        - in: query
+          name: hub.mode
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: hub.challenge
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: hub.verify_token
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+        '403':
+          description: Forbidden
+    post:
+      operationId: PostV1MetaWebhook
+      tags:
+        - Webhooks
+      summary: Meta Webhook Payload Receiver
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: OK
+
+  /v1/internal/webhook-schema:
+    post:
+      operationId: forceGenerateWebhookType
+      description: "Internal shadow endpoint to force generation of WebhookPayload type."
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookPayload'
+
+  /v1/messages:
+    post:
+      operationId: sendMessage
+      tags:
+        - Messages
+      summary: Send a WhatsApp message
+      description: Enqueues a message for delivery via WhatsApp.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema:
+            type: string
+          required: false
+          description: "Unique key to prevent duplicate message processing"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+      responses:
+        '202':
+          description: Message accepted and queued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SendMessageResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+        '429':
+          description: Quota exceeded
+
+  /v1/internal/tenant:
+    post:
+      operationId: syncTenant
+      tags:
+        - Internal
+      summary: Sync or provision a tenant
+      description: Internal endpoint to provision or update tenant configuration.
+      security:
+        - InternalAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Tenant'
+                - type: object
+                  required:
+                    - record
+                  properties:
+                    record:
+                      $ref: '#/components/schemas/Tenant'
+      responses:
+        '200':
+          description: Tenant synced successfully
+
+  /v1/internal/tenants/{id}/pause:
+    put:
+      operationId: pauseTenant
+      tags:
+        - Internal
+      summary: Pause a tenant
+      description: Manually pause message delivery for a tenant.
+      security:
+        - InternalAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Tenant paused successfully
+
+webhooks:
+  delivery_update:
+    post:
+      operationId: handleDeliveryUpdate
+      tags:
+        - Webhooks
+      summary: Delivery status update
+      description: Sent when a message status changes (sent, delivered, read, failed).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Webhook received
+</file>
+
+<file path="internal/api/spec/openapi.yaml">
+openapi: 3.0.3
+info:
+  title: Bhejna API
+  description: |
+    Bhejna is a high-performance WhatsApp messaging proxy and delivery engine. 
+    It provides a contract-first API for sending messages, tracking delivery status, and receiving inbound messages via webhooks.
+  version: 1.0.0
+  contact:
+    name: CodeNxt Lab
+    url: https://codenxtlab.tech
+
+servers:
+  - url: https://api.bhejna.codenxtlab.tech
+    description: Production Server
+
+tags:
+  - name: Messages
+    description: WhatsApp message delivery operations
+  - name: Internal
+    description: System administration and sync operations
+  - name: Webhooks
+    description: Inbound delivery status and message updates
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    InternalAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    MessageType:
+      type: string
+      enum: [text, template, image, document, audio, video, sticker, location, contacts, interactive]
+      description: Allowed WhatsApp message types
+
+    SendMessageRequest:
+      type: object
+      required:
+        - recipient
+        - message_type
+        - payload
+      properties:
+        recipient:
+          type: string
+          description: "E.164 formatted phone number (e.g., +1234567890)"
+          pattern: '^\+?\d{7,15}$'
+          example: "+1234567890"
+        message_type:
+          $ref: '#/components/schemas/MessageType'
+        payload:
+          type: object
+          description: "Meta-compatible message payload"
+          example:
+            body: "Hello, this is a test message from Bhejna!"
+
+    SendMessageResponse:
+      type: object
+      required:
+        - job_id
+        - status
+      properties:
+        job_id:
+          type: string
+          example: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        status:
+          type: string
+          enum: [queued]
+
+    Tenant:
+      type: object
+      required:
+        - id
+        - waba_id
+        - phone_number_id
+      properties:
+        id:
+          type: string
+        waba_id:
+          type: string
+        phone_number_id:
+          type: string
+        api_key:
+          type: string
+        messaging_limit:
+          type: integer
+        quality_rating:
+          type: string
+        is_paused:
+          type: boolean
+        webhook_url:
+          type: string
+        webhook_secret:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    SuccessResponse:
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+        request_id:
+          type: string
+          example: "req_123"
+
+    ErrorResponse:
+      type: object
+      required:
+        - success
+        - error
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              example: "INVALID_PHONE"
+            message:
+              type: string
+              example: "Recipient phone number invalid"
+            retryable:
+              type: boolean
+              example: false
+        request_id:
+          type: string
+          example: "req_123"
+
+    WebhookPayload:
+      type: object
+      required:
+        - object
+        - entry
+      properties:
+        object:
+          type: string
+          example: "whatsapp_business_account"
+        entry:
+          type: array
+          items:
+            type: object
+            required:
+              - id
+              - changes
+            properties:
+              id:
+                type: string
+                description: "WhatsApp Business Account ID"
+              changes:
+                type: array
+                items:
+                  type: object
+                  required:
+                    - field
+                    - value
+                  properties:
+                    field:
+                      type: string
+                      example: "messages"
+                    value:
+                      type: object
+                      properties:
+                        messaging_product:
+                          type: string
+                          example: "whatsapp"
+                        metadata:
+                          type: object
+                          properties:
+                            display_phone_number:
+                              type: string
+                            phone_number_id:
+                              type: string
+                        statuses:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: string
+                              status:
+                                type: string
+                                enum: [sent, delivered, read, failed, deleted]
+                              timestamp:
+                                type: string
+                              recipient_id:
+                                type: string
+                              errors:
+                                type: array
+                                items:
+                                  type: object
+                                  properties:
+                                    code:
+                                      type: integer
+                                    title:
+                                      type: string
+                        messages:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              from:
+                                type: string
+                              id:
+                                type: string
+                              timestamp:
+                                type: string
+                              type:
+                                type: string
+                              text:
+                                type: object
+                                properties:
+                                  body:
+                                    type: string
+
+paths:
+  /v1/meta/webhook:
+    get:
+      operationId: GetV1MetaWebhook
+      tags:
+        - Webhooks
+      summary: Meta Webhook Verification
+      parameters:
+        - in: query
+          name: hub.mode
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: hub.challenge
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: hub.verify_token
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+        '403':
+          description: Forbidden
+    post:
+      operationId: PostV1MetaWebhook
+      tags:
+        - Webhooks
+      summary: Meta Webhook Payload Receiver
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: OK
+
+  /v1/internal/webhook-schema:
+    post:
+      operationId: forceGenerateWebhookType
+      description: "Internal shadow endpoint to force generation of WebhookPayload type."
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookPayload'
+
+  /v1/messages:
+    post:
+      operationId: sendMessage
+      tags:
+        - Messages
+      summary: Send a WhatsApp message
+      description: Enqueues a message for delivery via WhatsApp.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema:
+            type: string
+          required: false
+          description: "Unique key to prevent duplicate message processing"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+      responses:
+        '202':
+          description: Message accepted and queued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SendMessageResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+        '429':
+          description: Quota exceeded
+
+  /v1/internal/tenant:
+    post:
+      operationId: syncTenant
+      tags:
+        - Internal
+      summary: Sync or provision a tenant
+      description: Internal endpoint to provision or update tenant configuration.
+      security:
+        - InternalAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Tenant'
+                - type: object
+                  required:
+                    - record
+                  properties:
+                    record:
+                      $ref: '#/components/schemas/Tenant'
+      responses:
+        '200':
+          description: Tenant synced successfully
+
+  /v1/internal/tenants/{id}/pause:
+    put:
+      operationId: pauseTenant
+      tags:
+        - Internal
+      summary: Pause a tenant
+      description: Manually pause message delivery for a tenant.
+      security:
+        - InternalAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Tenant paused successfully
+
+webhooks:
+  delivery_update:
+    post:
+      operationId: handleDeliveryUpdate
+      tags:
+        - Webhooks
+      summary: Delivery status update
+      description: Sent when a message status changes (sent, delivered, read, failed).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Webhook received
+</file>
+
+<file path="internal/db/schema.sql">
+-- Tenants table for multi-tenancy and status tracking
+CREATE TABLE IF NOT EXISTS tenants (
+    id TEXT PRIMARY KEY,
+    waba_id TEXT NOT NULL,
+    phone_number_id TEXT UNIQUE NOT NULL,
+    access_token TEXT NOT NULL,
+    messaging_limit INTEGER DEFAULT 250,
+    quality_rating TEXT DEFAULT 'GREEN',
+    is_paused BOOLEAN DEFAULT 0,
+    paused_until DATETIME,
+    pause_reason TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    webhook_url TEXT,
+    webhook_secret TEXT
+);
+
+-- Jobs table for message dispatching
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    recipient_phone TEXT NOT NULL,
+    message_type TEXT NOT NULL,
+    message_payload TEXT NOT NULL,
+    status TEXT DEFAULT 'queued',
+    status_level INTEGER DEFAULT 0,
+    meta_message_id TEXT,
+    meta_error_code TEXT,
+    meta_error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    next_retry_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    synced BOOLEAN DEFAULT 0,
+    idempotency_key TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id),
+    UNIQUE(tenant_id, idempotency_key)
+);
+
+-- Webhook events for idempotency and matching
+CREATE TABLE IF NOT EXISTS webhook_events (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE NOT NULL,
+    waba_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    raw_payload TEXT NOT NULL,
+    is_matched BOOLEAN DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Active 24h sessions
+CREATE TABLE IF NOT EXISTS active_sessions (
+    tenant_id TEXT NOT NULL,
+    recipient_phone TEXT NOT NULL,
+    expires_at DATETIME NOT NULL,
+    PRIMARY KEY (tenant_id, recipient_phone),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+);
+
+-- Client webhook queue for event egress
+CREATE TABLE IF NOT EXISTS client_webhook_queue (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT DEFAULT 'queued',
+    retry_count INTEGER DEFAULT 0,
+    next_retry_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+);
+
+-- Optimized Indexes
+CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(next_retry_at, created_at) 
+WHERE status = 'queued';
+
+CREATE INDEX IF NOT EXISTS idx_webhook_queue_claim ON client_webhook_queue(next_retry_at, created_at) 
+WHERE status = 'queued';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_wamid ON jobs(meta_message_id) 
+WHERE meta_message_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_webhooks_unmatched ON webhook_events(created_at) 
+WHERE is_matched = 0;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_window ON jobs(tenant_id, created_at) 
+WHERE status != 'failed';
+</file>
+
+<file path="internal/engine/webhook_worker.go">
+package engine
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+type ClientWebhookPool struct {
+	db     *db.DB
+	client *http.Client
+	wg     sync.WaitGroup
+}
+
+func NewClientWebhookPool(database *db.DB) *ClientWebhookPool {
+	return &ClientWebhookPool{
+		db: database,
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+		},
+	}
+}
+
+func (p *ClientWebhookPool) Start(ctx context.Context, workerCount int) {
+	for i := 0; i < workerCount; i++ {
+		p.wg.Add(1)
+		go p.worker(ctx, i)
+	}
+}
+
+// Stop blocks until all webhook workers have finished their current jobs.
+func (p *ClientWebhookPool) Stop() {
+	p.wg.Wait()
+}
+
+func (p *ClientWebhookPool) worker(ctx context.Context, id int) {
+	defer p.wg.Done()
+	log.Printf("[WebhookWorker %d] started", id)
+
+	// Outer loop: restarts the inner loop if a panic occurs.
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[WebhookWorker %d] stopping", id)
+			return
+		default:
+		}
+
+		exited := p.workerLoop(ctx, id)
+		if exited {
+			return
+		}
+		// Panicked and recovered — brief backoff before restarting.
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// workerLoop runs the main processing loop. Returns true if ctx was cancelled,
+// false if it exited due to a recovered panic.
+func (p *ClientWebhookPool) workerLoop(ctx context.Context, id int) (exited bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("CRITICAL: WebhookWorker %d panicked and will restart: %v", id, r)
+			exited = false
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[WebhookWorker %d] stopping", id)
+			return true
+		default:
+			job, err := p.db.ClaimClientWebhook()
+			if err != nil {
+				log.Printf("[WebhookWorker %d] Error claiming job: %v", id, err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			if job == nil {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			p.processJob(id, job)
+		}
+	}
+}
+
+func (p *ClientWebhookPool) processJob(workerID int, job *db.ClientWebhookJob) {
+	if job.WebhookURL == "" {
+		if err := p.db.MarkClientWebhookSuccess(job.ID); err != nil {
+			log.Printf("[WebhookWorker %d] ERROR: failed to mark job %s as success (no URL): %v", workerID, job.ID, err)
+		}
+		return
+	}
+
+	req, err := http.NewRequest("POST", job.WebhookURL, bytes.NewBufferString(job.Payload))
+	if err != nil {
+		log.Printf("[WebhookWorker %d] Error creating request: %v", workerID, err)
+		p.handleFailure(workerID, job)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Bhejna-Webhook-Egress/1.0")
+
+	if job.WebhookSecret != "" {
+		sig := calculateHMAC(job.Payload, job.WebhookSecret)
+		req.Header.Set("X-Bhejna-Signature", sig)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		log.Printf("[WebhookWorker %d] Request failed for job %s: %v", workerID, job.ID, err)
+		p.handleFailure(workerID, job)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := p.db.MarkClientWebhookSuccess(job.ID); err != nil {
+			log.Printf("[WebhookWorker %d] ERROR: failed to mark job %s as success: %v", workerID, job.ID, err)
+		}
+	} else {
+		log.Printf("[WebhookWorker %d] Job %s failed with status %d", workerID, job.ID, resp.StatusCode)
+		p.handleFailure(workerID, job)
+	}
+}
+
+func (p *ClientWebhookPool) handleFailure(workerID int, job *db.ClientWebhookJob) {
+	if job.RetryCount >= 5 {
+		log.Printf("[WebhookWorker %d] Job %s exhausted all retries, abandoning", workerID, job.ID)
+		return
+	}
+
+	backoff := time.Duration(math.Pow(2, float64(job.RetryCount))) * time.Minute
+	nextRetry := time.Now().UTC().Add(backoff)
+	if err := p.db.MarkClientWebhookFailed(job.ID, job.RetryCount+1, nextRetry); err != nil {
+		log.Printf("[WebhookWorker %d] ERROR: failed to mark job %s for retry: %v", workerID, job.ID, err)
+	}
+}
+
+func calculateHMAC(payload, secret string) string {
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write([]byte(payload))
+	return hex.EncodeToString(h.Sum(nil))
+}
+</file>
+
+<file path="Dockerfile">
+# Stage 1 (Builder)
+FROM golang:1.25-bookworm AS builder
+
+RUN apt-get update && apt-get install -y gcc libsqlite3-dev
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o bhejna ./cmd/bhejna
+
+# Stage 2 (Runner)
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates tzdata sqlite3 && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /app/data
+
+WORKDIR /app
+
+COPY --from=builder /app/bhejna .
+
+ENV DB_PATH=/app/data/bhejna.db
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/bhejna"]
+</file>
+
+<file path="internal/api/client.go">
+package api
+
+import (
+	"encoding/json"
+	"errors"
+	"log"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/api/generated"
+	"github.com/codenxtlab/bhejna/internal/db"
+	"github.com/oklog/ulid/v2"
+)
+
+// phoneRegex matches E.164-ish format: optional leading +, then 7-15 digits only.
+var phoneRegex = regexp.MustCompile(`^\+?\d{7,15}$`)
+
+// HandleSendMessage accepts a message request and enqueues it.
+func HandleSendMessage(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Cap client request bodies at 256KB to prevent OOM from oversized payloads
+		r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
+
+		tenant := GetTenant(r.Context())
+		if tenant == nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		var req generated.SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Bad Request: Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		// --- Input Sanitization ---
+
+		// 1. Strip all whitespace from phone number
+		req.Recipient = strings.ReplaceAll(req.Recipient, " ", "")
+		req.Recipient = strings.TrimSpace(req.Recipient)
+
+		// 2. Validate phone number format (E.164: optional +, 7-15 digits)
+		if !phoneRegex.MatchString(req.Recipient) {
+			http.Error(w, "Bad Request: Invalid recipient phone number format", http.StatusBadRequest)
+			return
+		}
+
+		// 3. Validate message type against generated enum
+		if !req.MessageType.Valid() {
+			http.Error(w, "Bad Request: Invalid message_type", http.StatusBadRequest)
+			return
+		}
+
+		// --- Quota Enforcement ---
+		if tenant.MessagingLimit > 0 {
+			count, err := database.CountTenantJobsInWindow(tenant.ID)
+			if err != nil {
+				log.Printf("Quota check error for tenant %s: %v", tenant.ID, err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+			if count >= tenant.MessagingLimit {
+				http.Error(w, "Rate Limit Exceeded: 24h messaging quota reached", http.StatusTooManyRequests)
+				return
+			}
+		}
+
+		idempotencyKey := r.Header.Get("Idempotency-Key")
+		var idempotencyPtr *string
+		if idempotencyKey != "" {
+			idempotencyPtr = &idempotencyKey
+		}
+
+		payloadBytes, err := json.Marshal(req.Payload)
+		if err != nil {
+			log.Printf("Error marshaling payload: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		// 4. Cap payload size (64KB max)
+		if len(payloadBytes) > 65536 {
+			http.Error(w, "Bad Request: Payload too large", http.StatusBadRequest)
+			return
+		}
+
+		jobID := ulid.Make().String()
+		job := &db.Job{
+			ID:             jobID,
+			TenantID:       tenant.ID,
+			RecipientPhone: req.Recipient,
+			MessageType:    string(req.MessageType),
+			MessagePayload: string(payloadBytes),
+			Status:         "queued",
+			StatusLevel:    0,
+			NextRetryAt:    time.Now().UTC(),
+			IdempotencyKey: idempotencyPtr,
+		}
+
+		if err := database.InsertJob(job); err != nil {
+			if errors.Is(err, db.ErrIdempotencyConflict) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				json.NewEncoder(w).Encode(generated.SendMessageResponse{
+					JobId:  "existing",
+					Status: generated.Queued,
+				})
+				return
+			}
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(generated.SendMessageResponse{
+			JobId:  jobID,
+			Status: generated.Queued,
+		})
+	}
+}
+</file>
+
+<file path="internal/db/db.go">
+package db
+
+import (
+	"database/sql"
+	_ "embed"
+	"fmt"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+//go:embed schema.sql
+var schemaSQL string
+
+// DB encapsulates a split-connection pool for SQLite.
+// SQLite in WAL mode allows multiple readers but only ONE concurrent writer.
+// We split the pools to ensure mutations are serialized (MaxOpenConns=1)
+// while lookups remain highly concurrent.
+type DB struct {
+	Writer *sql.DB
+	Reader *sql.DB
+}
+
+// InitDB initializes the SQLite connections with WAL mode and appropriate pool limits.
+func InitDB(dbPath string) (*DB, error) {
+	// DSN: WAL mode for concurrency, NORMAL sync for performance, and 5s busy timeout.
+	dsn := dbPath + "?_journal=WAL&_synchronous=NORMAL&_busy_timeout=5000"
+
+	writer, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// WRITER: Set to 1 to prevent "database is locked" errors by serializing all writes.
+	writer.SetMaxOpenConns(1)
+	writer.SetMaxIdleConns(1)
+
+	_, err = writer.Exec(schemaSQL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute schema: %w", err)
+	}
+
+	// Automatic Migrations
+	if err := applyMigrations(writer); err != nil {
+		return nil, fmt.Errorf("failed to apply migrations: %w", err)
+	}
+
+	reader, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// READER: Set to 10 to allow concurrent read-heavy operations (e.g. status checks).
+	reader.SetMaxOpenConns(10)
+	reader.SetMaxIdleConns(10)
+
+	return &DB{
+		Writer: writer,
+		Reader: reader,
+	}, nil
+}
+
+func applyMigrations(db *sql.DB) error {
+	// 1. Add meta_error_message to jobs table if it doesn't exist
+	var exists bool
+	query := "SELECT count(*) FROM pragma_table_info('jobs') WHERE name='meta_error_message'"
+	err := db.QueryRow(query).Scan(&exists)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		_, err = db.Exec("ALTER TABLE jobs ADD COLUMN meta_error_message TEXT")
+		if err != nil {
+			return err
+		}
+	}
+
+	// 2. Add quota enforcement index if it doesn't exist
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_tenant_window ON jobs(tenant_id, created_at) WHERE status != 'failed'`)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (db *DB) Close() error {
+	errW := db.Writer.Close()
+	errR := db.Reader.Close()
+	if errW != nil {
+		return fmt.Errorf("writer close: %w", errW)
+	}
+	return errR
+}
+</file>
+
+<file path="internal/engine/worker.go">
+package engine
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+type WorkerPool struct {
+	db          *db.DB
+	limiters    *LimiterManager
+	metaClient  *MetaAPIClient
+	workerCount int
+	wg          sync.WaitGroup
+}
+
+func NewWorkerPool(database *db.DB, limiters *LimiterManager, metaClient *MetaAPIClient, count int) *WorkerPool {
+	return &WorkerPool{
+		db:          database,
+		limiters:    limiters,
+		metaClient:  metaClient,
+		workerCount: count,
+	}
+}
+
+func (p *WorkerPool) Stop() {
+	p.wg.Wait()
+}
+
+func (p *WorkerPool) Start(ctx context.Context) {
+	for i := 0; i < p.workerCount; i++ {
+		p.wg.Add(1)
+		go p.worker(ctx, i)
+	}
+}
+
+func (p *WorkerPool) worker(ctx context.Context, id int) {
+	defer p.wg.Done()
+	log.Printf("Worker %d: started", id)
+
+	// Outer loop: restarts the inner loop if a panic occurs.
+	// The worker only exits permanently when ctx is cancelled.
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %d: stopping", id)
+			return
+		default:
+		}
+
+		exited := p.workerLoop(ctx, id)
+		if exited {
+			// Context was cancelled inside the loop, exit cleanly.
+			return
+		}
+		// If we reach here, the inner loop panicked and recovered.
+		// Brief backoff before restarting to avoid tight panic loops.
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// workerLoop runs the main processing loop. Returns true if ctx was cancelled,
+// false if it exited due to a recovered panic.
+func (p *WorkerPool) workerLoop(ctx context.Context, id int) (exited bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("CRITICAL: Worker %d panicked and will restart: %v", id, r)
+			exited = false
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %d: stopping", id)
+			return true
+		default:
+			// 1. Claim next job
+			job, err := p.db.ClaimNextJob()
+			if err != nil {
+				log.Printf("Worker %d: error claiming job: %v", id, err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			if job == nil {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			// Fetch tenant for access token and phone ID
+			tenant, err := p.db.GetTenant(job.TenantID)
+			if err != nil {
+				log.Printf("Worker %d: error fetching tenant %s: %v", id, job.TenantID, err)
+				p.db.RequeueWithJitter(job.ID)
+				continue
+			}
+			if tenant == nil {
+				log.Printf("Worker %d: tenant %s not found, failing job %s", id, job.TenantID, job.ID)
+				p.db.MarkJobFailed(job.ID, "TENANT_NOT_FOUND", "tenant was deleted")
+				continue
+			}
+
+			// 2. Check rate limit
+			if !p.limiters.Allow(tenant.ID, tenant.PhoneNumberID) {
+				p.db.RequeueWithJitter(job.ID)
+				continue
+			}
+
+			// 3. Send message
+			wamid, err := p.metaClient.SendMessage(job, tenant.AccessToken, tenant.PhoneNumberID)
+			if err != nil {
+				errorCode := "UNKNOWN"
+				errorMessage := err.Error()
+
+				if apiErr, ok := err.(*MetaAPIError); ok {
+					errorCode = fmt.Sprintf("%d", apiErr.Code)
+					errorMessage = apiErr.Message
+					if apiErr.RawBody != "" {
+						errorMessage = apiErr.RawBody
+					}
+				}
+
+				// 4. Handle transient error
+				if IsTransientError(err) {
+					log.Printf("Worker %d: transient error for job %s, requeueing: %v", id, job.ID, err)
+					p.db.RequeueWithJitter(job.ID)
+				} else if IsPolicyError(err) {
+					// 5. Handle policy error
+					log.Printf("Worker %d: policy violation for job %s, failing job and pausing tenant %s", id, job.ID, job.TenantID)
+					p.db.MarkJobFailed(job.ID, errorCode, errorMessage)
+					p.db.PauseTenant(job.TenantID, "POLICY_VIOLATION")
+				} else {
+					log.Printf("Worker %d: permanent failure for job %s: %v", id, job.ID, err)
+					p.db.MarkJobFailed(job.ID, errorCode, errorMessage)
+				}
+				continue
+			}
+
+			// 6. On success: Bind the wamid to the internal job ID.
+			// This is CRITICAL — if SetJobMetaID fails, delivery status webhooks
+			// from Meta will never match this job, creating an orphaned record.
+			if err := p.db.SetJobMetaID(job.ID, wamid); err != nil {
+				log.Printf("Worker %d: CRITICAL: failed to bind wamid %s to job %s: %v", id, wamid, job.ID, err)
+				// Fallback: mark accepted by job ID directly so it doesn't stay stuck in "processing"
+				if err := p.db.UpdateJobStatus(job.ID, "accepted", 2); err != nil {
+					log.Printf("Worker %d: ERROR: fallback UpdateJobStatus also failed for job %s: %v", id, job.ID, err)
+				}
+				continue
+			}
+
+			// Monotonic update to "accepted" (Level 2) by wamid
+			if _, err := p.db.UpdateJobMonotonic(wamid, "accepted", 2); err != nil {
+				log.Printf("Worker %d: error updating job %s to accepted: %v", id, job.ID, err)
+			}
+		}
+	}
+}
+</file>
+
+<file path="internal/api/internal.go">
+package api
+
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+
+	"github.com/codenxtlab/bhejna/internal/api/generated"
+	"github.com/codenxtlab/bhejna/internal/db"
+	"github.com/go-chi/chi/v5"
+)
+
+// HandleSyncTenant processes a provisioning request from SvelteKit or a Supabase Webhook.
+func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Cap internal payloads at 1MB to prevent OOM from oversized bodies
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+		// Read the body once so we can try multiple unmarshal strategies
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		// Check for system_token in body if not already authorized by middleware
+		var authCheck struct {
+			SystemToken string `json:"system_token"`
+		}
+		if err := json.Unmarshal(bodyBytes, &authCheck); err != nil {
+			log.Printf("Warning: Failed to unmarshal authCheck token: %v", err)
+		}
+
+		// Verification logic: check header first (via middleware usually), then body
+		authHeader := r.Header.Get("Authorization")
+		token := ""
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		} else if authCheck.SystemToken != "" {
+			token = authCheck.SystemToken
+		}
+
+		if token != internalSecret {
+			http.Error(w, "Unauthorized: Invalid or missing token", http.StatusUnauthorized)
+			return
+		}
+
+		var syncBody generated.SyncTenantJSONBody
+		if err := json.Unmarshal(bodyBytes, &syncBody); err != nil {
+			http.Error(w, "Bad Request: invalid payload structure", http.StatusBadRequest)
+			return
+		}
+
+		var genTenant generated.Tenant
+		// Try AsSyncTenantJSONBody1 first (the wrapped {record: ...} format)
+		if wrapped, err := syncBody.AsSyncTenantJSONBody1(); err == nil && wrapped.Record.Id != "" {
+			genTenant = wrapped.Record
+		} else if direct, err := syncBody.AsTenant(); err == nil && direct.Id != "" {
+			genTenant = direct
+		} else {
+			http.Error(w, "Bad Request: invalid tenant data", http.StatusBadRequest)
+			return
+		}
+
+		// Convert generated.Tenant to db.Tenant
+		tenant := &db.Tenant{
+			ID:            genTenant.Id,
+			WabaID:        genTenant.WabaId,
+			PhoneNumberID: genTenant.PhoneNumberId,
+			IsPaused:      false,
+		}
+
+		if genTenant.ApiKey != nil {
+			tenant.AccessToken = *genTenant.ApiKey
+		}
+		if genTenant.MessagingLimit != nil {
+			tenant.MessagingLimit = *genTenant.MessagingLimit
+		}
+		if genTenant.QualityRating != nil {
+			tenant.QualityRating = *genTenant.QualityRating
+		}
+		if genTenant.IsPaused != nil {
+			tenant.IsPaused = *genTenant.IsPaused
+		}
+		tenant.WebhookURL = genTenant.WebhookUrl
+		tenant.WebhookSecret = genTenant.WebhookSecret
+
+		// UPSERT the tenant into local SQLite
+		if err := database.InsertTenant(tenant); err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// HandlePauseTenant manually pauses a tenant.
+func HandlePauseTenant(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID := chi.URLParam(r, "id")
+		if tenantID == "" {
+			http.Error(w, "Bad Request: Missing ID", http.StatusBadRequest)
+			return
+		}
+
+		if err := database.PauseTenant(tenantID, "MANUAL_PAUSE"); err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+</file>
+
+<file path="internal/api/webhook.go">
+package api
+
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+
+	"github.com/codenxtlab/bhejna/internal/api/generated"
+	"github.com/codenxtlab/bhejna/internal/db"
+	"github.com/oklog/ulid/v2"
+)
+
+var statusLevels = map[string]int{
+	"sent":      3,
+	"delivered": 4,
+	"read":      5,
+	"failed":    3,
+}
+
+// HandleWebhookValidation handles Meta's verification challenge.
+func HandleWebhookValidation(verifyToken string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		mode := r.URL.Query().Get("hub.mode")
+		token := r.URL.Query().Get("hub.verify_token")
+		challenge := r.URL.Query().Get("hub.challenge")
+
+		if mode == "subscribe" && token == verifyToken {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(challenge))
+			return
+		}
+
+		http.Error(w, "Forbidden", http.StatusForbidden)
+	}
+}
+
+// HandleWebhookEvent processes status updates from Meta.
+func HandleWebhookEvent(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			// Always return 200 to Meta to avoid retries on bad payloads
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		var payload generated.WebhookPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Fast Path Sweep
+		for _, entry := range payload.Entry {
+			for _, change := range entry.Changes {
+				// 1. Check for Outbound Status Updates (Delivery Receipts)
+				if change.Value.Statuses != nil {
+					for _, status := range *change.Value.Statuses {
+						if status.Status == nil || status.Id == nil {
+							continue
+						}
+
+						statusStr := string(*status.Status)
+						level, exists := statusLevels[statusStr]
+						if !exists {
+							continue
+						}
+
+						// Insert raw event
+						event := &db.WebhookEvent{
+							ID:             ulid.Make().String(),
+							IdempotencyKey: *status.Id + ":" + statusStr,
+							WabaID:         entry.Id,
+							EventType:      statusStr,
+							RawPayload:     string(body),
+							IsMatched:      false,
+						}
+
+						matched, err := database.UpdateJobMonotonic(*status.Id, statusStr, level)
+						if err != nil {
+							log.Printf("[Webhook] ERROR: UpdateJobMonotonic failed for wamid %s: %v", *status.Id, err)
+						}
+						if matched {
+							event.IsMatched = true
+							// Enqueue for client egress
+							tenant, err := database.GetTenantByWabaID(entry.Id)
+							if err == nil && tenant != nil {
+								if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
+									log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for tenant %s: %v", tenant.ID, err)
+								}
+							}
+						}
+
+						if err := database.InsertWebhookEvent(event); err != nil {
+							log.Printf("[Webhook] ERROR: InsertWebhookEvent failed: %v", err)
+						}
+					}
+				}
+
+				// 2. Check for Inbound Messages (User replied)
+				if change.Value.Messages != nil {
+					for _, msg := range *change.Value.Messages {
+						if msg.From == nil || change.Value.Metadata == nil || change.Value.Metadata.PhoneNumberId == nil {
+							continue
+						}
+
+						phoneID := *change.Value.Metadata.PhoneNumberId
+						if phoneID != "" {
+							tenant, err := database.GetTenantByPhoneNumberID(phoneID)
+							if err == nil && tenant != nil {
+								// Open the 24-hour free messaging window
+								if err := database.UpsertActiveSession(tenant.ID, *msg.From); err != nil {
+									log.Printf("[Webhook] ERROR: UpsertActiveSession failed for tenant %s: %v", tenant.ID, err)
+								}
+
+								// Forward the inbound message to the client's webhook
+								if err := database.EnqueueClientWebhook(tenant.ID, string(body)); err != nil {
+									log.Printf("[Webhook] ERROR: EnqueueClientWebhook failed for inbound message, tenant %s: %v", tenant.ID, err)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}
+}
+</file>
+
+<file path="internal/db/models.go">
+package db
+
+import (
+	"database/sql"
+	"time"
+)
+
+type Tenant struct {
+	ID             string         `db:"id" json:"id"`
+	WabaID         string         `db:"waba_id" json:"waba_id"`
+	PhoneNumberID  string         `db:"phone_number_id" json:"phone_number_id"`
+	AccessToken    string         `db:"access_token" json:"api_key"`
+	MessagingLimit int            `db:"messaging_limit" json:"messaging_limit"`
+	QualityRating  string         `db:"quality_rating" json:"quality_rating"`
+	IsPaused       bool           `db:"is_paused" json:"is_paused"`
+	PausedUntil    sql.NullTime   `db:"paused_until" json:"-"`
+	PauseReason    sql.NullString `db:"pause_reason" json:"-"`
+	CreatedAt      time.Time      `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
+	WebhookURL     *string        `db:"webhook_url" json:"webhook_url"`
+	WebhookSecret  *string        `db:"webhook_secret" json:"webhook_secret"`
+}
+
+type Job struct {
+	ID               string         `db:"id"`
+	TenantID         string         `db:"tenant_id"`
+	RecipientPhone   string         `db:"recipient_phone"`
+	MessageType      string         `db:"message_type"`
+	MessagePayload   string         `db:"message_payload"`
+	Status           string         `db:"status"`
+	StatusLevel      int            `db:"status_level"`
+	MetaMessageID    sql.NullString `db:"meta_message_id"`
+	MetaErrorCode    sql.NullString `db:"meta_error_code"`
+	MetaErrorMessage sql.NullString `db:"meta_error_message"`
+	RetryCount       int            `db:"retry_count"`
+	NextRetryAt      time.Time      `db:"next_retry_at"`
+	Synced           bool           `db:"synced"`
+	IdempotencyKey   *string        `db:"idempotency_key"`
+	CreatedAt        time.Time      `db:"created_at"`
+	UpdatedAt        time.Time      `db:"updated_at"`
+}
+
+type WebhookEvent struct {
+	ID             string    `db:"id"`
+	IdempotencyKey string    `db:"idempotency_key"`
+	WabaID         string    `db:"waba_id"`
+	EventType      string    `db:"event_type"`
+	RawPayload     string    `db:"raw_payload"`
+	IsMatched      bool      `db:"is_matched"`
+	CreatedAt      time.Time `db:"created_at"`
+}
+
+type ActiveSession struct {
+	TenantID       string    `db:"tenant_id"`
+	RecipientPhone string    `db:"recipient_phone"`
+	ExpiresAt      time.Time `db:"expires_at"`
+}
+
+type ClientWebhookJob struct {
+	ID            string    `db:"id"`
+	TenantID      string    `db:"tenant_id"`
+	Payload       string    `db:"payload"`
+	Status        string    `db:"status"`
+	RetryCount    int       `db:"retry_count"`
+	NextRetryAt   time.Time `db:"next_retry_at"`
+	CreatedAt     time.Time `db:"created_at"`
+	WebhookURL    string    `db:"webhook_url"`    // Joined from tenants
+	WebhookSecret string    `db:"webhook_secret"` // Joined from tenants
+}
+</file>
+
+<file path="internal/engine/sync.go">
+package engine
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+// SupabaseJob matches the schema of the Supabase jobs_analytics table.
+type SupabaseJob struct {
+	ID             string `json:"id"`
+	TenantID       string `json:"tenant_id"`
+	RecipientPhone string `json:"recipient_phone"`
+	MessageType    string `json:"message_type"`
+	Status         string `json:"status"`
+	MetaErrorCode  int    `json:"meta_error_code"`
+	CreatedAt      string `json:"created_at"`
+}
+
+// StartSupabaseSync starts the worker that syncs terminal job states to Supabase.
+func StartSupabaseSync(ctx context.Context, database *db.DB, supabaseURL, supabaseServiceKey string) {
+	if supabaseURL == "" || supabaseServiceKey == "" {
+		log.Println("Supabase sync disabled: missing URL or Service Role Key")
+		return
+	}
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	log.Println("Supabase Sync Worker started")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Supabase Sync Worker stopping...")
+			return
+		case <-ticker.C:
+			if err := syncJobs(database, client, supabaseURL, supabaseServiceKey); err != nil {
+				log.Printf("Supabase Sync Error: %v", err)
+			}
+		}
+	}
+}
+
+func syncJobs(database *db.DB, client *http.Client, url, key string) error {
+	// Fetch up to 100 unsynced jobs
+	jobs, err := database.GetUnsyncedJobs(100)
+	if err != nil {
+		return fmt.Errorf("failed to fetch unsynced jobs: %w", err)
+	}
+
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	// Map to Supabase structure
+	var payload []SupabaseJob
+	var jobIDs []string
+
+	for _, j := range jobs {
+		sj := SupabaseJob{
+			ID:             j.ID,
+			TenantID:       j.TenantID,
+			RecipientPhone: j.RecipientPhone,
+			MessageType:    j.MessageType,
+			Status:         j.Status,
+			CreatedAt:      j.CreatedAt.Format(time.RFC3339),
+		}
+		if j.MetaErrorCode.Valid {
+			code, _ := strconv.Atoi(j.MetaErrorCode.String)
+			sj.MetaErrorCode = code
+		}
+		payload = append(payload, sj)
+		jobIDs = append(jobIDs, j.ID)
+	}
+
+	// Prepare request
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("%s/rest/v1/jobs_analytics", url)
+	req, err := http.NewRequest("POST", reqURL, bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("apikey", key)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Prefer", "return=minimal")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := database.MarkJobsSynced(jobIDs); err != nil {
+			return fmt.Errorf("failed to mark jobs as synced: %w", err)
+		}
+		log.Printf("Successfully synced %d jobs to Supabase", len(jobIDs))
+	} else {
+		return fmt.Errorf("supabase returned non-2xx status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// HydrateTenantsFromSupabase fetches all tenants from Supabase and upserts them locally.
+func HydrateTenantsFromSupabase(database *db.DB, url, key string) error {
+	reqURL := fmt.Sprintf("%s/rest/v1/tenants?select=*", url)
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create hydration request: %w", err)
+	}
+
+	req.Header.Set("apikey", key)
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute hydration request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("supabase returned non-200 status during hydration: %d", resp.StatusCode)
+	}
+
+	var tenants []db.Tenant
+	if err := json.NewDecoder(resp.Body).Decode(&tenants); err != nil {
+		return fmt.Errorf("failed to decode hydration response: %w", err)
+	}
+
+	for _, t := range tenants {
+		if err := database.UpsertTenantByPhone(&t); err != nil {
+			return fmt.Errorf("failed to upsert tenant %s during hydration: %w", t.PhoneNumberID, err)
+		}
+	}
+
+	log.Printf("Boot-Time Hydration complete: successfully synced %d tenants from Supabase", len(tenants))
+	return nil
+}
+</file>
+
+<file path="go.mod">
+module github.com/codenxtlab/bhejna
+
+go 1.25.0
+
+require (
+	github.com/getkin/kin-openapi v0.135.0
+	github.com/go-chi/chi/v5 v5.2.5
+	github.com/joho/godotenv v1.5.1
+	github.com/mattn/go-sqlite3 v1.14.44
+	github.com/oapi-codegen/runtime v1.4.0
+	github.com/oklog/ulid/v2 v2.1.1
+	golang.org/x/time v0.15.0
+)
+
+require (
+	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/go-openapi/jsonpointer v0.22.4 // indirect
+	github.com/go-openapi/swag/jsonname v0.25.4 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/josharian/intern v1.0.0 // indirect
+	github.com/kr/pretty v0.3.1 // indirect
+	github.com/mailru/easyjson v0.9.1 // indirect
+	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826 // indirect
+	github.com/oasdiff/yaml v0.0.9 // indirect
+	github.com/oasdiff/yaml3 v0.0.9 // indirect
+	github.com/perimeterx/marshmallow v1.1.5 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/rogpeppe/go-internal v1.13.1 // indirect
+	github.com/woodsbury/decimal128 v1.4.0 // indirect
+	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
+)
+</file>
+
+<file path="internal/engine/meta_client.go">
+package engine
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/db"
+)
+
+type MetaAPIClient struct {
+	client *http.Client
+}
+
+func NewMetaAPIClient() *MetaAPIClient {
+	return &MetaAPIClient{
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}
+}
+
+// --- REQUEST STRUCTS ---
+
+type SendMessagePayload struct {
+	MessagingProduct string           `json:"messaging_product"` // Always "whatsapp"
+	RecipientType    string           `json:"recipient_type"`    // Always "individual"
+	To               string           `json:"to"`
+	Type             string           `json:"type"` // "text" or "template"
+	Text             *TextContent     `json:"text,omitempty"`
+	Template         *TemplateContent `json:"template,omitempty"`
+}
+
+type TextContent struct {
+	PreviewURL bool   `json:"preview_url"`
+	Body       string `json:"body"`
+}
+
+type TemplateContent struct {
+	Name       string              `json:"name"`
+	Language   TemplateLanguage    `json:"language"`
+	Components []TemplateComponent `json:"components,omitempty"`
+}
+
+type TemplateLanguage struct {
+	Code string `json:"code"` // e.g., "en_US"
+}
+
+type TemplateComponent struct {
+	Type       string              `json:"type"` // "header", "body", "button"
+	Parameters []TemplateParameter `json:"parameters"`
+}
+
+type TemplateParameter struct {
+	Type string `json:"type"` // "text", "currency", "image", etc.
+	Text string `json:"text,omitempty"`
+}
+
+// --- RESPONSE STRUCTS ---
+
+// MetaMessageResponse is what Meta returns on a 200 OK.
+type MetaMessageResponse struct {
+	MessagingProduct string `json:"messaging_product"`
+	Contacts         []struct {
+		Input string `json:"input"`
+		WaID  string `json:"wa_id"`
+	} `json:"contacts"`
+	Messages []struct {
+		ID string `json:"id"` // This is the wamid.HBg... you need to save
+	} `json:"messages"`
+}
+
+// MetaErrorResponse is what Meta returns on 4xx/5xx errors.
+type MetaErrorResponse struct {
+	Error struct {
+		Message   string `json:"message"`
+		Type      string `json:"type"`
+		Code      int    `json:"code"`
+		ErrorData struct {
+			Details string `json:"details"`
+		} `json:"error_data"`
+		ErrorSubcode int `json:"error_subcode"` // Critical for identifying 131048 limits
+	} `json:"error"`
+}
+
+type MetaAPIError struct {
+	StatusCode int
+	Code       int
+	Message    string
+	RawBody    string
+}
+
+func (e *MetaAPIError) Error() string {
+	return fmt.Sprintf("meta api error (status %d, code %d): %s", e.StatusCode, e.Code, e.Message)
+}
+
+func (c *MetaAPIClient) SendMessage(job *db.Job, accessToken string, phoneNumberID string) (string, error) {
+	// 1. Token Source: Use Global System Token if available
+	systemToken := os.Getenv("META_SYSTEM_USER_TOKEN")
+	if systemToken != "" {
+		accessToken = systemToken
+	}
+
+	url := fmt.Sprintf("https://graph.facebook.com/v25.0/%s/messages", phoneNumberID)
+
+	// 2. Reconstruct Meta Envelope
+	// job.MessagePayload is the inner content (e.g. the template object)
+	var innerPayload interface{}
+	if err := json.Unmarshal([]byte(job.MessagePayload), &innerPayload); err != nil {
+		return "", fmt.Errorf("failed to parse internal payload: %w", err)
+	}
+
+	envelope := map[string]interface{}{
+		"messaging_product":        "whatsapp",
+		"to":                       job.RecipientPhone,
+		"type":                     job.MessageType,
+		"biz_opaque_callback_data": job.ID,
+	}
+
+	// Fix double-nesting: if innerPayload already has the type as a key, unwrap it
+	if m, ok := innerPayload.(map[string]interface{}); ok {
+		if content, exists := m[job.MessageType]; exists {
+			envelope[job.MessageType] = content
+		} else {
+			envelope[job.MessageType] = innerPayload
+		}
+	} else {
+		envelope[job.MessageType] = innerPayload
+	}
+
+	envelopeBytes, err := json.Marshal(envelope)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal meta envelope: %w", err)
+	}
+
+	// LOG: Meta Request (metadata only — no PII)
+	log.Printf("Worker sending to Meta: phoneID=%s | type=%s | jobID=%s | size=%d bytes",
+		phoneNumberID, job.MessageType, job.ID, len(envelopeBytes))
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(envelopeBytes))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		// LOG: Meta Error Body
+		log.Printf("Meta API Error (%d): %s", resp.StatusCode, string(body))
+
+		var errResp MetaErrorResponse
+		if err := json.Unmarshal(body, &errResp); err != nil {
+			return "", &MetaAPIError{
+				StatusCode: resp.StatusCode,
+				Message:    fmt.Sprintf("unknown error: %s", string(body)),
+				RawBody:    string(body),
+			}
+		}
+		return "", &MetaAPIError{
+			StatusCode: resp.StatusCode,
+			Code:       errResp.Error.Code,
+			Message:    errResp.Error.Message,
+			RawBody:    string(body),
+		}
+	}
+
+	var metaResp MetaMessageResponse
+	if err := json.Unmarshal(body, &metaResp); err != nil {
+		return "", fmt.Errorf("failed to decode meta response: %v", err)
+	}
+
+	if len(metaResp.Messages) == 0 {
+		return "", fmt.Errorf("no message id returned in meta response")
+	}
+
+	return metaResp.Messages[0].ID, nil
+}
+
+// IsTransientError returns true for 5xx errors or network failures.
+func IsTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := err.(*MetaAPIError); ok {
+		return apiErr.StatusCode >= 500
+	}
+	return true
+}
+
+// IsPolicyError returns true for 4xx errors or specific policy violation codes.
+func IsPolicyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := err.(*MetaAPIError); ok {
+		// 131048: Rate limit hit
+		return apiErr.StatusCode == 400 || apiErr.Code == 131048
+	}
+	return false
+}
+</file>
+
+<file path="internal/db/repository.go">
+package db
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"math/rand"
+	"strings"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+)
+
+var ErrIdempotencyConflict = errors.New("idempotency key already exists")
+
+// ClaimNextJob finds the oldest 'queued' job for an active tenant and marks it 'processing'.
+func (db *DB) ClaimNextJob() (*Job, error) {
+	query := `
+		UPDATE jobs 
+		SET status = 'processing', status_level = 1, updated_at = CURRENT_TIMESTAMP
+		WHERE id = (
+			SELECT j.id 
+			FROM jobs j
+			JOIN tenants t ON j.tenant_id = t.id
+			WHERE j.status = 'queued' 
+			  AND j.next_retry_at <= CURRENT_TIMESTAMP 
+			  AND t.is_paused = 0
+			ORDER BY j.next_retry_at ASC, j.created_at ASC
+			LIMIT 1
+		)
+		RETURNING id, tenant_id, recipient_phone, message_type, message_payload, 
+		          status, status_level, meta_message_id, meta_error_code, meta_error_message, 
+		          retry_count, next_retry_at, synced, created_at, updated_at`
+
+	var j Job
+	err := db.Writer.QueryRow(query).Scan(
+		&j.ID, &j.TenantID, &j.RecipientPhone, &j.MessageType, &j.MessagePayload,
+		&j.Status, &j.StatusLevel, &j.MetaMessageID, &j.MetaErrorCode, &j.MetaErrorMessage,
+		&j.RetryCount, &j.NextRetryAt, &j.Synced, &j.CreatedAt, &j.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &j, err
+}
+
+// UpdateJobMonotonic updates status only if the new level is strictly higher.
+// This is critical for WhatsApp webhooks because 'delivered' or 'read' events
+// may arrive before the 'sent' confirmation from the initial API call.
+func (db *DB) UpdateJobMonotonic(metaMessageID string, newStatus string, newLevel int) (bool, error) {
+	query := `
+		UPDATE jobs 
+		SET status = ?, status_level = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE meta_message_id = ? AND status_level < ?`
+
+	res, err := db.Writer.Exec(query, newStatus, newLevel, metaMessageID, newLevel)
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := res.RowsAffected()
+	return rows > 0, err
+}
+
+// RequeueWithJitter pushes a job back to 'queued' with a random delay.
+func (db *DB) RequeueWithJitter(jobID string) error {
+	// 3s base + [0, 2]s random jitter
+	jitter := time.Duration(3+rand.Intn(3)) * time.Second
+	nextRetry := time.Now().UTC().Add(jitter)
+
+	query := `
+		UPDATE jobs 
+		SET status = 'queued', status_level = 0, next_retry_at = ?, 
+		    retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`
+
+	_, err := db.Writer.Exec(query, nextRetry, jobID)
+	return err
+}
+
+// GetTenant retrieves tenant details.
+func (db *DB) GetTenant(id string) (*Tenant, error) {
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE id = ?`
+	var t Tenant
+	err := db.Reader.QueryRow(query, id).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// PauseTenant disables a tenant for policy violations.
+func (db *DB) PauseTenant(id string, reason string) error {
+	query := `UPDATE tenants SET is_paused = 1, pause_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	_, err := db.Writer.Exec(query, reason, id)
+	return err
+}
+
+// UpdateJobStatus updates the status of a job by ID.
+func (db *DB) UpdateJobStatus(id string, status string, level int) error {
+	query := `UPDATE jobs SET status = ?, status_level = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	_, err := db.Writer.Exec(query, status, level, id)
+	return err
+}
+
+// MarkJobFailed records the failure reason and updates status.
+func (db *DB) MarkJobFailed(id string, errorCode string, errorMessage string) error {
+	query := `
+		UPDATE jobs 
+		SET status = 'failed', 
+		    status_level = 6,
+		    meta_error_code = ?, 
+		    meta_error_message = ?, 
+		    updated_at = CURRENT_TIMESTAMP 
+		WHERE id = ?`
+	_, err := db.Writer.Exec(query, errorCode, errorMessage, id)
+	return err
+}
+
+// SetJobMetaID binds the Meta WAMID to our internal job record.
+func (db *DB) SetJobMetaID(id string, metaID string) error {
+	query := `UPDATE jobs SET meta_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	_, err := db.Writer.Exec(query, metaID, id)
+	return err
+}
+
+// GetUnmatchedEvents returns events that haven't been reconciled yet.
+func (db *DB) GetUnmatchedEvents() ([]WebhookEvent, error) {
+	query := `SELECT id, raw_payload FROM webhook_events WHERE is_matched = 0 LIMIT 100`
+	rows, err := db.Reader.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []WebhookEvent
+	for rows.Next() {
+		var e WebhookEvent
+		if err := rows.Scan(&e.ID, &e.RawPayload); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+// MarkEventMatched marks a webhook event as processed.
+func (db *DB) MarkEventMatched(id string) error {
+	query := `UPDATE webhook_events SET is_matched = 1 WHERE id = ?`
+	_, err := db.Writer.Exec(query, id)
+	return err
+}
+
+// GetStaleJobs finds jobs stuck in 'accepted' status for too long.
+func (db *DB) GetStaleJobs(threshold time.Duration) ([]Job, error) {
+	cutoff := time.Now().UTC().Add(-threshold)
+	query := `SELECT id, tenant_id, updated_at FROM jobs WHERE status = 'accepted' AND updated_at < ?`
+	rows, err := db.Reader.Query(query, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var j Job
+		if err := rows.Scan(&j.ID, &j.TenantID, &j.UpdatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
+// GetTenantByAccessToken retrieves a tenant by their API key.
+func (db *DB) GetTenantByAccessToken(token string) (*Tenant, error) {
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE access_token = ?`
+	var t Tenant
+	err := db.Reader.QueryRow(query, token).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// InsertJob enqueues a new message job.
+func (db *DB) InsertJob(j *Job) error {
+	query := `INSERT INTO jobs (id, tenant_id, recipient_phone, message_type, message_payload, status, status_level, next_retry_at, idempotency_key, meta_error_code, meta_error_message) 
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := db.Writer.Exec(query, j.ID, j.TenantID, j.RecipientPhone, j.MessageType, j.MessagePayload, j.Status, j.StatusLevel, j.NextRetryAt, j.IdempotencyKey, j.MetaErrorCode, j.MetaErrorMessage)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") && strings.Contains(err.Error(), "idempotency_key") {
+			return ErrIdempotencyConflict
+		}
+		return err
+	}
+	return nil
+}
+
+// InsertTenant provisions or syncs a tenant.
+func (db *DB) InsertTenant(t *Tenant) error {
+	query := `
+		INSERT INTO tenants (
+			id, waba_id, phone_number_id, access_token, 
+			messaging_limit, quality_rating, is_paused,
+			webhook_url, webhook_secret
+		) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET 
+			waba_id = excluded.waba_id,
+			phone_number_id = excluded.phone_number_id,
+			access_token = excluded.access_token,
+			messaging_limit = excluded.messaging_limit,
+			quality_rating = excluded.quality_rating,
+			is_paused = excluded.is_paused,
+			webhook_url = COALESCE(excluded.webhook_url, tenants.webhook_url),
+			webhook_secret = COALESCE(excluded.webhook_secret, tenants.webhook_secret),
+			updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := db.Writer.Exec(query,
+		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken,
+		t.MessagingLimit, t.QualityRating, t.IsPaused,
+		t.WebhookURL, t.WebhookSecret,
+	)
+	return err
+}
+
+// UpsertTenantByPhone provisions or syncs a tenant based on phone number id.
+func (db *DB) UpsertTenantByPhone(t *Tenant) error {
+	query := `
+		INSERT INTO tenants (
+			id, waba_id, phone_number_id, access_token, 
+			messaging_limit, quality_rating, is_paused,
+			webhook_url, webhook_secret
+		) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(phone_number_id) DO UPDATE SET 
+			id = excluded.id,
+			waba_id = excluded.waba_id,
+			access_token = excluded.access_token,
+			messaging_limit = excluded.messaging_limit,
+			quality_rating = excluded.quality_rating,
+			is_paused = excluded.is_paused,
+			webhook_url = COALESCE(excluded.webhook_url, tenants.webhook_url),
+			webhook_secret = COALESCE(excluded.webhook_secret, tenants.webhook_secret),
+			updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := db.Writer.Exec(query,
+		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken,
+		t.MessagingLimit, t.QualityRating, t.IsPaused,
+		t.WebhookURL, t.WebhookSecret,
+	)
+	return err
+}
+
+// CountTenantJobsInWindow returns the number of non-failed jobs for a tenant
+// created within the last 24 hours. This is the enforcement counter for
+// the tenant's messaging_limit quota.
+func (db *DB) CountTenantJobsInWindow(tenantID string) (int, error) {
+	query := `
+		SELECT COUNT(*) FROM jobs 
+		WHERE tenant_id = ? 
+		  AND created_at >= datetime('now', '-24 hours') 
+		  AND status != 'failed'`
+
+	var count int
+	err := db.Reader.QueryRow(query, tenantID).Scan(&count)
+	return count, err
+}
+
+// InsertWebhookEvent records a raw Meta event.
+func (db *DB) InsertWebhookEvent(e *WebhookEvent) error {
+	query := `INSERT INTO webhook_events (id, idempotency_key, waba_id, event_type, raw_payload, is_matched) 
+	          VALUES (?, ?, ?, ?, ?, ?)`
+	_, err := db.Writer.Exec(query, e.ID, e.IdempotencyKey, e.WabaID, e.EventType, e.RawPayload, e.IsMatched)
+	return err
+}
+
+// GetUnsyncedJobs selects up to limit jobs that are in a terminal state and haven't been synced.
+func (db *DB) GetUnsyncedJobs(limit int) ([]Job, error) {
+	query := `
+		SELECT id, tenant_id, recipient_phone, message_type, status, meta_error_code, meta_error_message, created_at 
+		FROM jobs 
+		WHERE synced = 0 
+		  AND status IN ('delivered', 'read', 'failed')
+		LIMIT ?`
+
+	rows, err := db.Reader.Query(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var j Job
+		if err := rows.Scan(&j.ID, &j.TenantID, &j.RecipientPhone, &j.MessageType, &j.Status, &j.MetaErrorCode, &j.MetaErrorMessage, &j.CreatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
+// MarkJobsSynced updates the synced flag to 1 for the given slice of job IDs.
+func (db *DB) MarkJobsSynced(jobIDs []string) error {
+	if len(jobIDs) == 0 {
+		return nil
+	}
+
+	// SQLite supports up to 999 variables by default, but for simplicity we'll
+	// just execute them in a single transaction if needed, or use a single query if small.
+	// For this worker, the limit is likely small (e.g. 100).
+	query := `UPDATE jobs SET synced = 1 WHERE id = ?`
+
+	tx, err := db.Writer.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(query)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, id := range jobIDs {
+		if _, err := stmt.Exec(id); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// DeleteOldSyncedJobs purges jobs that are already synced and older than the specified days.
+func (db *DB) DeleteOldSyncedJobs(days int) (int64, error) {
+	query := `DELETE FROM jobs WHERE synced = 1 AND created_at < datetime('now', '-' || ? || ' days')`
+	res, err := db.Writer.Exec(query, days)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// GetTenantByPhoneNumberID retrieves a tenant by their Meta Phone Number ID.
+func (db *DB) GetTenantByPhoneNumberID(phoneID string) (*Tenant, error) {
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE phone_number_id = ?`
+	var t Tenant
+	err := db.Reader.QueryRow(query, phoneID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// GetTenantByWabaID retrieves a tenant by their Meta WABA ID.
+func (db *DB) GetTenantByWabaID(wabaID string) (*Tenant, error) {
+	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE waba_id = ?`
+	var t Tenant
+	err := db.Reader.QueryRow(query, wabaID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
+// UpsertActiveSession updates or inserts a 24-hour active session.
+func (db *DB) UpsertActiveSession(tenantID, recipientPhone string) error {
+	query := `
+		INSERT INTO active_sessions (tenant_id, recipient_phone, expires_at) 
+		VALUES (?, ?, datetime('now', '+24 hours')) 
+		ON CONFLICT(tenant_id, recipient_phone) 
+		DO UPDATE SET expires_at = datetime('now', '+24 hours')`
+	_, err := db.Writer.Exec(query, tenantID, recipientPhone)
+	return err
+}
+
+// EnqueueClientWebhook adds a payload to the client egress queue.
+func (db *DB) EnqueueClientWebhook(tenantID string, payload string) error {
+	id := ulid.Make().String()
+	query := `INSERT INTO client_webhook_queue (id, tenant_id, payload) VALUES (?, ?, ?)`
+	_, err := db.Writer.Exec(query, id, tenantID, payload)
+	return err
+}
+
+// ClaimClientWebhook grabs the oldest queued webhook job and joins tenant info.
+func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
+	query := `
+		UPDATE client_webhook_queue 
+		SET status = 'processing', next_retry_at = datetime('now', '+1 minute')
+		WHERE id = (
+			SELECT q.id 
+			FROM client_webhook_queue q
+			WHERE q.status = 'queued' AND q.next_retry_at <= CURRENT_TIMESTAMP
+			ORDER BY q.created_at ASC
+			LIMIT 1
+		)
+		RETURNING id, tenant_id, payload, status, retry_count, next_retry_at, created_at`
+
+	var q ClientWebhookJob
+	err := db.Writer.QueryRow(query).Scan(
+		&q.ID, &q.TenantID, &q.Payload, &q.Status, &q.RetryCount, &q.NextRetryAt, &q.CreatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Join tenant info manually for simplicity or use a CTE in the RETURNING (though RETURNING join is tricky in SQLite)
+	tenant, err := db.GetTenant(q.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	if tenant == nil {
+		return nil, fmt.Errorf("tenant %s not found for webhook job %s", q.TenantID, q.ID)
+	}
+
+	if tenant.WebhookURL != nil {
+		q.WebhookURL = *tenant.WebhookURL
+	}
+	if tenant.WebhookSecret != nil {
+		q.WebhookSecret = *tenant.WebhookSecret
+	}
+
+	return &q, nil
+}
+
+// MarkClientWebhookFailed updates retry count and next retry time.
+func (db *DB) MarkClientWebhookFailed(id string, retryCount int, nextRetry time.Time) error {
+	query := `UPDATE client_webhook_queue SET status = 'queued', retry_count = ?, next_retry_at = ? WHERE id = ?`
+	_, err := db.Writer.Exec(query, retryCount, nextRetry, id)
+	return err
+}
+
+// MarkClientWebhookSuccess marks the job as completed.
+func (db *DB) MarkClientWebhookSuccess(id string) error {
+	query := `UPDATE client_webhook_queue SET status = 'completed' WHERE id = ?`
+	_, err := db.Writer.Exec(query, id)
+	return err
+}
+</file>
+
+<file path="cmd/bhejna/main.go">
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/codenxtlab/bhejna/internal/api"
+	"github.com/codenxtlab/bhejna/internal/api/generated"
+	"github.com/codenxtlab/bhejna/internal/api/handlers"
+	"github.com/codenxtlab/bhejna/internal/db"
+	"github.com/codenxtlab/bhejna/internal/engine"
+	"github.com/codenxtlab/bhejna/internal/services"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/joho/godotenv"
+)
+
+func main() {
+	// 0. Load Environment Variables from file
+	envFile := ".env"
+	if os.Getenv("GO_ENV") == "production" {
+		envFile = ".env.production"
+	}
+	if err := godotenv.Load(envFile); err != nil {
+		log.Printf("Warning: Error loading %s file: %v (relying on system env)", envFile, err)
+	}
+
+	// 1. Load configuration from environment
+	dbPath := getEnv("DB_PATH", "bhejna.db")
+	port := getEnv("PORT", "8080")
+	metaAppSecret := os.Getenv("META_APP_SECRET")
+	if metaAppSecret == "" {
+		log.Fatal("Fatal: META_APP_SECRET is missing from the environment")
+	}
+	internalSecret := getEnv("INTERNAL_SECRET", "control_plane_secret")
+	metaVerifyToken := os.Getenv("META_VERIFY_TOKEN")
+	if metaVerifyToken == "" {
+		log.Fatal("Fatal: META_VERIFY_TOKEN is missing from the environment")
+	}
+	workerCount := 5 // Default worker count
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseServiceKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+	// 2. Initialize Database
+	database, err := db.InitDB(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer database.Close()
+
+	// 2.5 Boot-Time Hydration
+	if supabaseServiceKey != "" && supabaseURL != "" {
+		log.Println("Starting Boot-Time Hydration from Supabase...")
+		if err := engine.HydrateTenantsFromSupabase(database, supabaseURL, supabaseServiceKey); err != nil {
+			log.Fatalf("Fatal: Boot-Time Hydration failed: %v", err)
+		}
+	} else {
+		log.Println("Warning: SUPABASE_SERVICE_ROLE_KEY or SUPABASE_URL missing, skipping boot-time hydration.")
+	}
+
+	// 3. Initialize Engine Components
+	limiters := engine.NewLimiterManager()
+	metaClient := engine.NewMetaAPIClient()
+	pool := engine.NewWorkerPool(database, limiters, metaClient, workerCount)
+
+	// Context for background tasks
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 4. Start Worker Pool
+	pool.Start(ctx)
+
+	// 4.5 Start Client Webhook Pool
+	webhookPool := engine.NewClientWebhookPool(database)
+	webhookPool.Start(ctx, 10)
+
+	// 5. Start Janitors — tracked by a WaitGroup so shutdown waits for them
+	var bgWg sync.WaitGroup
+
+	bgWg.Add(1)
+	go func() {
+		defer bgWg.Done()
+		engine.StartJanitor(ctx, database)
+	}()
+
+	if supabaseServiceKey != "" {
+		bgWg.Add(1)
+		go func() {
+			defer bgWg.Done()
+			engine.StartSupabaseSync(ctx, database, supabaseURL, supabaseServiceKey)
+		}()
+	} else {
+		log.Println("Error: SUPABASE_SERVICE_ROLE_KEY is missing. Supabase sync engine is disabled.")
+	}
+
+	bgWg.Add(1)
+	go func() {
+		defer bgWg.Done()
+		engine.StartCleanupJanitor(ctx, database)
+	}()
+
+	// 6. Set up Chi Router
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	dispatcher := services.NewWebhookDispatcher(database)
+	webhookHandler := handlers.NewMetaWebhook(database, dispatcher, metaVerifyToken)
+	apiServer := &api.Server{
+		DB:             database,
+		InternalSecret: internalSecret,
+		WebhookHandler: webhookHandler,
+	}
+	wrapper := generated.ServerInterfaceWrapper{
+		Handler: apiServer,
+	}
+
+	// Webhook routes
+	r.Get("/v1/meta/webhook", wrapper.GetV1MetaWebhook)
+	r.With(api.MetaSignatureMiddleware(metaAppSecret)).Post("/v1/meta/webhook", wrapper.PostV1MetaWebhook)
+
+	// Group 2: Client routes
+	r.Group(func(r chi.Router) {
+		r.Use(api.APIKeyMiddleware(database))
+		r.Post("/v1/messages", api.HandleSendMessage(database))
+	})
+
+	// Group 3: Internal routes
+	// Note: HandleSyncTenant is outside the strict InternalJWTMiddleware group
+	// because it now handles its own auth (checking both Header and Body).
+	r.Post("/v1/internal/tenant", api.HandleSyncTenant(database, internalSecret))
+
+	r.Group(func(r chi.Router) {
+		r.Use(api.InternalJWTMiddleware(internalSecret))
+		r.Put("/v1/internal/tenants/{id}/pause", api.HandlePauseTenant(database))
+	})
+
+	// 7. Start HTTP Server
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	go func() {
+		log.Printf("Bhejna API started on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Listen: %v", err)
+		}
+	}()
+
+	// 8. Graceful Shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	<-stop
+	log.Println("Shutting down gracefully...")
+
+	// Cancel background context — signals all workers and janitors to stop
+	cancel()
+
+	// Shutdown HTTP server — stops accepting new connections, waits for in-flight
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server Shutdown: %v", err)
+	}
+
+	// Wait for all worker pools to drain their in-flight jobs
+	log.Println("Server stopped. Waiting for workers to finish...")
+	pool.Stop()
+	log.Println("Message workers stopped. Waiting for webhook workers...")
+	webhookPool.Stop()
+	log.Println("Webhook workers stopped. Waiting for background janitors...")
+	bgWg.Wait()
+	log.Println("Bhejna shutdown complete.")
+}
+
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+</file>
+
+</files>

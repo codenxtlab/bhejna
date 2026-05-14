@@ -31,7 +31,7 @@ type SendMessagePayload struct {
 	MessagingProduct string           `json:"messaging_product"` // Always "whatsapp"
 	RecipientType    string           `json:"recipient_type"`    // Always "individual"
 	To               string           `json:"to"`
-	Type             string           `json:"type"`              // "text" or "template"
+	Type             string           `json:"type"` // "text" or "template"
 	Text             *TextContent     `json:"text,omitempty"`
 	Template         *TemplateContent `json:"template,omitempty"`
 }
@@ -42,8 +42,8 @@ type TextContent struct {
 }
 
 type TemplateContent struct {
-	Name       string             `json:"name"`
-	Language   TemplateLanguage   `json:"language"`
+	Name       string              `json:"name"`
+	Language   TemplateLanguage    `json:"language"`
 	Components []TemplateComponent `json:"components,omitempty"`
 }
 
@@ -52,7 +52,7 @@ type TemplateLanguage struct {
 }
 
 type TemplateComponent struct {
-	Type       string             `json:"type"` // "header", "body", "button"
+	Type       string              `json:"type"` // "header", "body", "button"
 	Parameters []TemplateParameter `json:"parameters"`
 }
 

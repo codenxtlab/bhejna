@@ -81,7 +81,7 @@ func (p *ClientWebhookPool) workerLoop(ctx context.Context, id int) (exited bool
 			log.Printf("[WebhookWorker %d] stopping", id)
 			return true
 		default:
-			job, err := p.db.ClaimClientWebhook()
+			job, err := p.db.ClaimClientWebhook(ctx)
 			if err != nil {
 				log.Printf("[WebhookWorker %d] Error claiming job: %v", id, err)
 				time.Sleep(1 * time.Second)
@@ -93,14 +93,14 @@ func (p *ClientWebhookPool) workerLoop(ctx context.Context, id int) (exited bool
 				continue
 			}
 
-			p.processJob(id, job)
+			p.processJob(ctx, id, job)
 		}
 	}
 }
 
-func (p *ClientWebhookPool) processJob(workerID int, job *db.ClientWebhookJob) {
+func (p *ClientWebhookPool) processJob(ctx context.Context, workerID int, job *db.ClientWebhookJob) {
 	if job.WebhookURL == "" {
-		if err := p.db.MarkClientWebhookSuccess(job.ID); err != nil {
+		if err := p.db.MarkClientWebhookSuccess(ctx, job.ID); err != nil {
 			log.Printf("[WebhookWorker %d] ERROR: failed to mark job %s as success (no URL): %v", workerID, job.ID, err)
 		}
 		return
@@ -109,7 +109,7 @@ func (p *ClientWebhookPool) processJob(workerID int, job *db.ClientWebhookJob) {
 	req, err := http.NewRequest("POST", job.WebhookURL, bytes.NewBufferString(job.Payload))
 	if err != nil {
 		log.Printf("[WebhookWorker %d] Error creating request: %v", workerID, err)
-		p.handleFailure(workerID, job)
+		p.handleFailure(ctx, workerID, job)
 		return
 	}
 
@@ -124,23 +124,23 @@ func (p *ClientWebhookPool) processJob(workerID int, job *db.ClientWebhookJob) {
 	resp, err := p.client.Do(req)
 	if err != nil {
 		log.Printf("[WebhookWorker %d] Request failed for job %s: %v", workerID, job.ID, err)
-		p.handleFailure(workerID, job)
+		p.handleFailure(ctx, workerID, job)
 		return
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if err := p.db.MarkClientWebhookSuccess(job.ID); err != nil {
+		if err := p.db.MarkClientWebhookSuccess(ctx, job.ID); err != nil {
 			log.Printf("[WebhookWorker %d] ERROR: failed to mark job %s as success: %v", workerID, job.ID, err)
 		}
 	} else {
 		log.Printf("[WebhookWorker %d] Job %s failed with status %d", workerID, job.ID, resp.StatusCode)
-		p.handleFailure(workerID, job)
+		p.handleFailure(ctx, workerID, job)
 	}
 }
 
-func (p *ClientWebhookPool) handleFailure(workerID int, job *db.ClientWebhookJob) {
+func (p *ClientWebhookPool) handleFailure(ctx context.Context, workerID int, job *db.ClientWebhookJob) {
 	if job.RetryCount >= 5 {
 		log.Printf("[WebhookWorker %d] Job %s exhausted all retries, abandoning", workerID, job.ID)
 		return
@@ -148,7 +148,7 @@ func (p *ClientWebhookPool) handleFailure(workerID int, job *db.ClientWebhookJob
 
 	backoff := time.Duration(math.Pow(2, float64(job.RetryCount))) * time.Minute
 	nextRetry := time.Now().UTC().Add(backoff)
-	if err := p.db.MarkClientWebhookFailed(job.ID, job.RetryCount+1, nextRetry); err != nil {
+	if err := p.db.MarkClientWebhookFailed(ctx, job.ID, job.RetryCount+1, nextRetry); err != nil {
 		log.Printf("[WebhookWorker %d] ERROR: failed to mark job %s for retry: %v", workerID, job.ID, err)
 	}
 }

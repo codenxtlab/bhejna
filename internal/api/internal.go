@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -28,7 +29,9 @@ func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
 		var authCheck struct {
 			SystemToken string `json:"system_token"`
 		}
-		json.Unmarshal(bodyBytes, &authCheck)
+		if err := json.Unmarshal(bodyBytes, &authCheck); err != nil {
+			log.Printf("Warning: Failed to unmarshal authCheck token: %v", err)
+		}
 
 		// Verification logic: check header first (via middleware usually), then body
 		authHeader := r.Header.Get("Authorization")
@@ -85,7 +88,7 @@ func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
 		tenant.WebhookSecret = genTenant.WebhookSecret
 
 		// UPSERT the tenant into local SQLite
-		if err := database.InsertTenant(tenant); err != nil {
+		if err := database.InsertTenant(r.Context(), tenant); err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
@@ -93,8 +96,6 @@ func HandleSyncTenant(database *db.DB, internalSecret string) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 	}
 }
-
-
 
 // HandlePauseTenant manually pauses a tenant.
 func HandlePauseTenant(database *db.DB) http.HandlerFunc {
@@ -105,7 +106,7 @@ func HandlePauseTenant(database *db.DB) http.HandlerFunc {
 			return
 		}
 
-		if err := database.PauseTenant(tenantID, "MANUAL_PAUSE"); err != nil {
+		if err := database.PauseTenant(r.Context(), tenantID, "MANUAL_PAUSE"); err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
@@ -113,4 +114,3 @@ func HandlePauseTenant(database *db.DB) http.HandlerFunc {
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
-

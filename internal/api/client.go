@@ -55,7 +55,7 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 
 		// --- Quota Enforcement ---
 		if tenant.MessagingLimit > 0 {
-			count, err := database.CountTenantJobsInWindow(tenant.ID)
+			count, err := database.CountTenantJobsInWindow(r.Context(), tenant.ID)
 			if err != nil {
 				log.Printf("Quota check error for tenant %s: %v", tenant.ID, err)
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -73,7 +73,12 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 			idempotencyPtr = &idempotencyKey
 		}
 
-		payloadBytes, _ := json.Marshal(req.Payload)
+		payloadBytes, err := json.Marshal(req.Payload)
+		if err != nil {
+			log.Printf("Error marshaling payload: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
 		// 4. Cap payload size (64KB max)
 		if len(payloadBytes) > 65536 {
 			http.Error(w, "Bad Request: Payload too large", http.StatusBadRequest)
@@ -93,7 +98,7 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 			IdempotencyKey: idempotencyPtr,
 		}
 
-		if err := database.InsertJob(job); err != nil {
+		if err := database.InsertJob(r.Context(), job); err != nil {
 			if errors.Is(err, db.ErrIdempotencyConflict) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusAccepted)
@@ -115,6 +120,3 @@ func HandleSendMessage(database *db.DB) http.HandlerFunc {
 		})
 	}
 }
-
-
-

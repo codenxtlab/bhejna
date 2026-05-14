@@ -11,8 +11,11 @@ import (
 	"time"
 
 	"github.com/codenxtlab/bhejna/internal/api"
+	"github.com/codenxtlab/bhejna/internal/api/generated"
+	"github.com/codenxtlab/bhejna/internal/api/handlers"
 	"github.com/codenxtlab/bhejna/internal/db"
 	"github.com/codenxtlab/bhejna/internal/engine"
+	"github.com/codenxtlab/bhejna/internal/services"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
@@ -31,9 +34,15 @@ func main() {
 	// 1. Load configuration from environment
 	dbPath := getEnv("DB_PATH", "bhejna.db")
 	port := getEnv("PORT", "8080")
-	metaAppSecret := getEnv("META_APP_SECRET", "super_secret_app")
+	metaAppSecret := os.Getenv("META_APP_SECRET")
+	if metaAppSecret == "" {
+		log.Fatal("Fatal: META_APP_SECRET is missing from the environment")
+	}
 	internalSecret := getEnv("INTERNAL_SECRET", "control_plane_secret")
-	metaVerifyToken := getEnv("META_VERIFY_TOKEN", "verify_me")
+	metaVerifyToken := os.Getenv("META_VERIFY_TOKEN")
+	if metaVerifyToken == "" {
+		log.Fatal("Fatal: META_VERIFY_TOKEN is missing from the environment")
+	}
 	workerCount := 5 // Default worker count
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	supabaseServiceKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -101,9 +110,20 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
+	dispatcher := services.NewWebhookDispatcher(database)
+	webhookHandler := handlers.NewMetaWebhook(database, dispatcher, metaVerifyToken)
+	apiServer := &api.Server{
+		DB:             database,
+		InternalSecret: internalSecret,
+		WebhookHandler: webhookHandler,
+	}
+	wrapper := generated.ServerInterfaceWrapper{
+		Handler: apiServer,
+	}
+
 	// Webhook routes
-	r.Get("/webhook", api.HandleWebhookValidation(metaVerifyToken))
-	r.With(api.MetaSignatureMiddleware(metaAppSecret)).Post("/webhook", api.HandleWebhookEvent(database))
+	r.Get("/v1/meta/webhook", wrapper.GetV1MetaWebhook)
+	r.With(api.MetaSignatureMiddleware(metaAppSecret)).Post("/v1/meta/webhook", wrapper.PostV1MetaWebhook)
 
 	// Group 2: Client routes
 	r.Group(func(r chi.Router) {
@@ -112,10 +132,10 @@ func main() {
 	})
 
 	// Group 3: Internal routes
-	// Note: HandleSyncTenant is outside the strict InternalJWTMiddleware group 
+	// Note: HandleSyncTenant is outside the strict InternalJWTMiddleware group
 	// because it now handles its own auth (checking both Header and Body).
 	r.Post("/v1/internal/tenant", api.HandleSyncTenant(database, internalSecret))
-	
+
 	r.Group(func(r chi.Router) {
 		r.Use(api.InternalJWTMiddleware(internalSecret))
 		r.Put("/v1/internal/tenants/{id}/pause", api.HandlePauseTenant(database))

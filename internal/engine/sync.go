@@ -47,16 +47,16 @@ func StartSupabaseSync(ctx context.Context, database *db.DB, supabaseURL, supaba
 			log.Println("Supabase Sync Worker stopping...")
 			return
 		case <-ticker.C:
-			if err := syncJobs(database, client, supabaseURL, supabaseServiceKey); err != nil {
+			if err := syncJobs(ctx, database, client, supabaseURL, supabaseServiceKey); err != nil {
 				log.Printf("Supabase Sync Error: %v", err)
 			}
 		}
 	}
 }
 
-func syncJobs(database *db.DB, client *http.Client, url, key string) error {
+func syncJobs(ctx context.Context, database *db.DB, client *http.Client, url, key string) error {
 	// Fetch up to 100 unsynced jobs
-	jobs, err := database.GetUnsyncedJobs(100)
+	jobs, err := database.GetUnsyncedJobs(ctx, 100)
 	if err != nil {
 		return fmt.Errorf("failed to fetch unsynced jobs: %w", err)
 	}
@@ -111,7 +111,7 @@ func syncJobs(database *db.DB, client *http.Client, url, key string) error {
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if err := database.MarkJobsSynced(jobIDs); err != nil {
+		if err := database.MarkJobsSynced(ctx, jobIDs); err != nil {
 			return fmt.Errorf("failed to mark jobs as synced: %w", err)
 		}
 		log.Printf("Successfully synced %d jobs to Supabase", len(jobIDs))
@@ -124,6 +124,7 @@ func syncJobs(database *db.DB, client *http.Client, url, key string) error {
 
 // HydrateTenantsFromSupabase fetches all tenants from Supabase and upserts them locally.
 func HydrateTenantsFromSupabase(database *db.DB, url, key string) error {
+	ctx := context.Background()
 	reqURL := fmt.Sprintf("%s/rest/v1/tenants?select=*", url)
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
@@ -150,7 +151,7 @@ func HydrateTenantsFromSupabase(database *db.DB, url, key string) error {
 	}
 
 	for _, t := range tenants {
-		if err := database.UpsertTenantByPhone(&t); err != nil {
+		if err := database.UpsertTenantByPhone(ctx, &t); err != nil {
 			return fmt.Errorf("failed to upsert tenant %s during hydration: %w", t.PhoneNumberID, err)
 		}
 	}

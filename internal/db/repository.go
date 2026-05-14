@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -14,7 +15,7 @@ import (
 var ErrIdempotencyConflict = errors.New("idempotency key already exists")
 
 // ClaimNextJob finds the oldest 'queued' job for an active tenant and marks it 'processing'.
-func (db *DB) ClaimNextJob() (*Job, error) {
+func (db *DB) ClaimNextJob(ctx context.Context) (*Job, error) {
 	query := `
 		UPDATE jobs 
 		SET status = 'processing', status_level = 1, updated_at = CURRENT_TIMESTAMP
@@ -33,7 +34,7 @@ func (db *DB) ClaimNextJob() (*Job, error) {
 		          retry_count, next_retry_at, synced, created_at, updated_at`
 
 	var j Job
-	err := db.Writer.QueryRow(query).Scan(
+	err := db.Writer.QueryRowContext(ctx, query).Scan(
 		&j.ID, &j.TenantID, &j.RecipientPhone, &j.MessageType, &j.MessagePayload,
 		&j.Status, &j.StatusLevel, &j.MetaMessageID, &j.MetaErrorCode, &j.MetaErrorMessage,
 		&j.RetryCount, &j.NextRetryAt, &j.Synced, &j.CreatedAt, &j.UpdatedAt,
@@ -48,13 +49,13 @@ func (db *DB) ClaimNextJob() (*Job, error) {
 // UpdateJobMonotonic updates status only if the new level is strictly higher.
 // This is critical for WhatsApp webhooks because 'delivered' or 'read' events
 // may arrive before the 'sent' confirmation from the initial API call.
-func (db *DB) UpdateJobMonotonic(metaMessageID string, newStatus string, newLevel int) (bool, error) {
+func (db *DB) UpdateJobMonotonic(ctx context.Context, metaMessageID string, newStatus string, newLevel int) (bool, error) {
 	query := `
 		UPDATE jobs 
 		SET status = ?, status_level = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE meta_message_id = ? AND status_level < ?`
 
-	res, err := db.Writer.Exec(query, newStatus, newLevel, metaMessageID, newLevel)
+	res, err := db.Writer.ExecContext(ctx, query, newStatus, newLevel, metaMessageID, newLevel)
 	if err != nil {
 		return false, err
 	}
@@ -64,7 +65,7 @@ func (db *DB) UpdateJobMonotonic(metaMessageID string, newStatus string, newLeve
 }
 
 // RequeueWithJitter pushes a job back to 'queued' with a random delay.
-func (db *DB) RequeueWithJitter(jobID string) error {
+func (db *DB) RequeueWithJitter(ctx context.Context, jobID string) error {
 	// 3s base + [0, 2]s random jitter
 	jitter := time.Duration(3+rand.Intn(3)) * time.Second
 	nextRetry := time.Now().UTC().Add(jitter)
@@ -75,15 +76,15 @@ func (db *DB) RequeueWithJitter(jobID string) error {
 		    retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?`
 
-	_, err := db.Writer.Exec(query, nextRetry, jobID)
+	_, err := db.Writer.ExecContext(ctx, query, nextRetry, jobID)
 	return err
 }
 
 // GetTenant retrieves tenant details.
-func (db *DB) GetTenant(id string) (*Tenant, error) {
+func (db *DB) GetTenant(ctx context.Context, id string) (*Tenant, error) {
 	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE id = ?`
 	var t Tenant
-	err := db.Reader.QueryRow(query, id).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	err := db.Reader.QueryRowContext(ctx, query, id).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -94,21 +95,21 @@ func (db *DB) GetTenant(id string) (*Tenant, error) {
 }
 
 // PauseTenant disables a tenant for policy violations.
-func (db *DB) PauseTenant(id string, reason string) error {
+func (db *DB) PauseTenant(ctx context.Context, id string, reason string) error {
 	query := `UPDATE tenants SET is_paused = 1, pause_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	_, err := db.Writer.Exec(query, reason, id)
+	_, err := db.Writer.ExecContext(ctx, query, reason, id)
 	return err
 }
 
 // UpdateJobStatus updates the status of a job by ID.
-func (db *DB) UpdateJobStatus(id string, status string, level int) error {
+func (db *DB) UpdateJobStatus(ctx context.Context, id string, status string, level int) error {
 	query := `UPDATE jobs SET status = ?, status_level = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	_, err := db.Writer.Exec(query, status, level, id)
+	_, err := db.Writer.ExecContext(ctx, query, status, level, id)
 	return err
 }
 
 // MarkJobFailed records the failure reason and updates status.
-func (db *DB) MarkJobFailed(id string, errorCode string, errorMessage string) error {
+func (db *DB) MarkJobFailed(ctx context.Context, id string, errorCode string, errorMessage string) error {
 	query := `
 		UPDATE jobs 
 		SET status = 'failed', 
@@ -117,21 +118,21 @@ func (db *DB) MarkJobFailed(id string, errorCode string, errorMessage string) er
 		    meta_error_message = ?, 
 		    updated_at = CURRENT_TIMESTAMP 
 		WHERE id = ?`
-	_, err := db.Writer.Exec(query, errorCode, errorMessage, id)
+	_, err := db.Writer.ExecContext(ctx, query, errorCode, errorMessage, id)
 	return err
 }
 
 // SetJobMetaID binds the Meta WAMID to our internal job record.
-func (db *DB) SetJobMetaID(id string, metaID string) error {
+func (db *DB) SetJobMetaID(ctx context.Context, id string, metaID string) error {
 	query := `UPDATE jobs SET meta_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	_, err := db.Writer.Exec(query, metaID, id)
+	_, err := db.Writer.ExecContext(ctx, query, metaID, id)
 	return err
 }
 
 // GetUnmatchedEvents returns events that haven't been reconciled yet.
-func (db *DB) GetUnmatchedEvents() ([]WebhookEvent, error) {
+func (db *DB) GetUnmatchedEvents(ctx context.Context) ([]WebhookEvent, error) {
 	query := `SELECT id, raw_payload FROM webhook_events WHERE is_matched = 0 LIMIT 100`
-	rows, err := db.Reader.Query(query)
+	rows, err := db.Reader.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -149,17 +150,17 @@ func (db *DB) GetUnmatchedEvents() ([]WebhookEvent, error) {
 }
 
 // MarkEventMatched marks a webhook event as processed.
-func (db *DB) MarkEventMatched(id string) error {
+func (db *DB) MarkEventMatched(ctx context.Context, id string) error {
 	query := `UPDATE webhook_events SET is_matched = 1 WHERE id = ?`
-	_, err := db.Writer.Exec(query, id)
+	_, err := db.Writer.ExecContext(ctx, query, id)
 	return err
 }
 
 // GetStaleJobs finds jobs stuck in 'accepted' status for too long.
-func (db *DB) GetStaleJobs(threshold time.Duration) ([]Job, error) {
+func (db *DB) GetStaleJobs(ctx context.Context, threshold time.Duration) ([]Job, error) {
 	cutoff := time.Now().UTC().Add(-threshold)
 	query := `SELECT id, tenant_id, updated_at FROM jobs WHERE status = 'accepted' AND updated_at < ?`
-	rows, err := db.Reader.Query(query, cutoff)
+	rows, err := db.Reader.QueryContext(ctx, query, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -177,10 +178,10 @@ func (db *DB) GetStaleJobs(threshold time.Duration) ([]Job, error) {
 }
 
 // GetTenantByAccessToken retrieves a tenant by their API key.
-func (db *DB) GetTenantByAccessToken(token string) (*Tenant, error) {
+func (db *DB) GetTenantByAccessToken(ctx context.Context, token string) (*Tenant, error) {
 	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE access_token = ?`
 	var t Tenant
-	err := db.Reader.QueryRow(query, token).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	err := db.Reader.QueryRowContext(ctx, query, token).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -188,10 +189,10 @@ func (db *DB) GetTenantByAccessToken(token string) (*Tenant, error) {
 }
 
 // InsertJob enqueues a new message job.
-func (db *DB) InsertJob(j *Job) error {
+func (db *DB) InsertJob(ctx context.Context, j *Job) error {
 	query := `INSERT INTO jobs (id, tenant_id, recipient_phone, message_type, message_payload, status, status_level, next_retry_at, idempotency_key, meta_error_code, meta_error_message) 
 	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := db.Writer.Exec(query, j.ID, j.TenantID, j.RecipientPhone, j.MessageType, j.MessagePayload, j.Status, j.StatusLevel, j.NextRetryAt, j.IdempotencyKey, j.MetaErrorCode, j.MetaErrorMessage)
+	_, err := db.Writer.ExecContext(ctx, query, j.ID, j.TenantID, j.RecipientPhone, j.MessageType, j.MessagePayload, j.Status, j.StatusLevel, j.NextRetryAt, j.IdempotencyKey, j.MetaErrorCode, j.MetaErrorMessage)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") && strings.Contains(err.Error(), "idempotency_key") {
 			return ErrIdempotencyConflict
@@ -202,7 +203,7 @@ func (db *DB) InsertJob(j *Job) error {
 }
 
 // InsertTenant provisions or syncs a tenant.
-func (db *DB) InsertTenant(t *Tenant) error {
+func (db *DB) InsertTenant(ctx context.Context, t *Tenant) error {
 	query := `
 		INSERT INTO tenants (
 			id, waba_id, phone_number_id, access_token, 
@@ -221,8 +222,8 @@ func (db *DB) InsertTenant(t *Tenant) error {
 			webhook_secret = COALESCE(excluded.webhook_secret, tenants.webhook_secret),
 			updated_at = CURRENT_TIMESTAMP
 	`
-	_, err := db.Writer.Exec(query, 
-		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken, 
+	_, err := db.Writer.ExecContext(ctx, query,
+		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken,
 		t.MessagingLimit, t.QualityRating, t.IsPaused,
 		t.WebhookURL, t.WebhookSecret,
 	)
@@ -230,7 +231,7 @@ func (db *DB) InsertTenant(t *Tenant) error {
 }
 
 // UpsertTenantByPhone provisions or syncs a tenant based on phone number id.
-func (db *DB) UpsertTenantByPhone(t *Tenant) error {
+func (db *DB) UpsertTenantByPhone(ctx context.Context, t *Tenant) error {
 	query := `
 		INSERT INTO tenants (
 			id, waba_id, phone_number_id, access_token, 
@@ -249,8 +250,8 @@ func (db *DB) UpsertTenantByPhone(t *Tenant) error {
 			webhook_secret = COALESCE(excluded.webhook_secret, tenants.webhook_secret),
 			updated_at = CURRENT_TIMESTAMP
 	`
-	_, err := db.Writer.Exec(query, 
-		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken, 
+	_, err := db.Writer.ExecContext(ctx, query,
+		t.ID, t.WabaID, t.PhoneNumberID, t.AccessToken,
 		t.MessagingLimit, t.QualityRating, t.IsPaused,
 		t.WebhookURL, t.WebhookSecret,
 	)
@@ -260,7 +261,7 @@ func (db *DB) UpsertTenantByPhone(t *Tenant) error {
 // CountTenantJobsInWindow returns the number of non-failed jobs for a tenant
 // created within the last 24 hours. This is the enforcement counter for
 // the tenant's messaging_limit quota.
-func (db *DB) CountTenantJobsInWindow(tenantID string) (int, error) {
+func (db *DB) CountTenantJobsInWindow(ctx context.Context, tenantID string) (int, error) {
 	query := `
 		SELECT COUNT(*) FROM jobs 
 		WHERE tenant_id = ? 
@@ -268,19 +269,20 @@ func (db *DB) CountTenantJobsInWindow(tenantID string) (int, error) {
 		  AND status != 'failed'`
 
 	var count int
-	err := db.Reader.QueryRow(query, tenantID).Scan(&count)
+	err := db.Reader.QueryRowContext(ctx, query, tenantID).Scan(&count)
 	return count, err
 }
 
 // InsertWebhookEvent records a raw Meta event.
-func (db *DB) InsertWebhookEvent(e *WebhookEvent) error {
+func (db *DB) InsertWebhookEvent(ctx context.Context, e *WebhookEvent) error {
 	query := `INSERT INTO webhook_events (id, idempotency_key, waba_id, event_type, raw_payload, is_matched) 
 	          VALUES (?, ?, ?, ?, ?, ?)`
-	_, err := db.Writer.Exec(query, e.ID, e.IdempotencyKey, e.WabaID, e.EventType, e.RawPayload, e.IsMatched)
+	_, err := db.Writer.ExecContext(ctx, query, e.ID, e.IdempotencyKey, e.WabaID, e.EventType, e.RawPayload, e.IsMatched)
 	return err
 }
+
 // GetUnsyncedJobs selects up to limit jobs that are in a terminal state and haven't been synced.
-func (db *DB) GetUnsyncedJobs(limit int) ([]Job, error) {
+func (db *DB) GetUnsyncedJobs(ctx context.Context, limit int) ([]Job, error) {
 	query := `
 		SELECT id, tenant_id, recipient_phone, message_type, status, meta_error_code, meta_error_message, created_at 
 		FROM jobs 
@@ -288,7 +290,7 @@ func (db *DB) GetUnsyncedJobs(limit int) ([]Job, error) {
 		  AND status IN ('delivered', 'read', 'failed')
 		LIMIT ?`
 
-	rows, err := db.Reader.Query(query, limit)
+	rows, err := db.Reader.QueryContext(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -306,17 +308,17 @@ func (db *DB) GetUnsyncedJobs(limit int) ([]Job, error) {
 }
 
 // MarkJobsSynced updates the synced flag to 1 for the given slice of job IDs.
-func (db *DB) MarkJobsSynced(jobIDs []string) error {
+func (db *DB) MarkJobsSynced(ctx context.Context, jobIDs []string) error {
 	if len(jobIDs) == 0 {
 		return nil
 	}
 
-	// SQLite supports up to 999 variables by default, but for simplicity we'll 
+	// SQLite supports up to 999 variables by default, but for simplicity we'll
 	// just execute them in a single transaction if needed, or use a single query if small.
 	// For this worker, the limit is likely small (e.g. 100).
 	query := `UPDATE jobs SET synced = 1 WHERE id = ?`
-	
-	tx, err := db.Writer.Begin()
+
+	tx, err := db.Writer.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -329,7 +331,7 @@ func (db *DB) MarkJobsSynced(jobIDs []string) error {
 	defer stmt.Close()
 
 	for _, id := range jobIDs {
-		if _, err := stmt.Exec(id); err != nil {
+		if _, err := stmt.ExecContext(ctx, id); err != nil {
 			return err
 		}
 	}
@@ -338,9 +340,9 @@ func (db *DB) MarkJobsSynced(jobIDs []string) error {
 }
 
 // DeleteOldSyncedJobs purges jobs that are already synced and older than the specified days.
-func (db *DB) DeleteOldSyncedJobs(days int) (int64, error) {
+func (db *DB) DeleteOldSyncedJobs(ctx context.Context, days int) (int64, error) {
 	query := `DELETE FROM jobs WHERE synced = 1 AND created_at < datetime('now', '-' || ? || ' days')`
-	res, err := db.Writer.Exec(query, days)
+	res, err := db.Writer.ExecContext(ctx, query, days)
 	if err != nil {
 		return 0, err
 	}
@@ -348,10 +350,10 @@ func (db *DB) DeleteOldSyncedJobs(days int) (int64, error) {
 }
 
 // GetTenantByPhoneNumberID retrieves a tenant by their Meta Phone Number ID.
-func (db *DB) GetTenantByPhoneNumberID(phoneID string) (*Tenant, error) {
+func (db *DB) GetTenantByPhoneNumberID(ctx context.Context, phoneID string) (*Tenant, error) {
 	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE phone_number_id = ?`
 	var t Tenant
-	err := db.Reader.QueryRow(query, phoneID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	err := db.Reader.QueryRowContext(ctx, query, phoneID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -359,10 +361,10 @@ func (db *DB) GetTenantByPhoneNumberID(phoneID string) (*Tenant, error) {
 }
 
 // GetTenantByWabaID retrieves a tenant by their Meta WABA ID.
-func (db *DB) GetTenantByWabaID(wabaID string) (*Tenant, error) {
+func (db *DB) GetTenantByWabaID(ctx context.Context, wabaID string) (*Tenant, error) {
 	query := `SELECT id, waba_id, phone_number_id, access_token, messaging_limit, quality_rating, is_paused, webhook_url, webhook_secret FROM tenants WHERE waba_id = ?`
 	var t Tenant
-	err := db.Reader.QueryRow(query, wabaID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
+	err := db.Reader.QueryRowContext(ctx, query, wabaID).Scan(&t.ID, &t.WabaID, &t.PhoneNumberID, &t.AccessToken, &t.MessagingLimit, &t.QualityRating, &t.IsPaused, &t.WebhookURL, &t.WebhookSecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -370,26 +372,26 @@ func (db *DB) GetTenantByWabaID(wabaID string) (*Tenant, error) {
 }
 
 // UpsertActiveSession updates or inserts a 24-hour active session.
-func (db *DB) UpsertActiveSession(tenantID, recipientPhone string) error {
+func (db *DB) UpsertActiveSession(ctx context.Context, tenantID, recipientPhone string) error {
 	query := `
 		INSERT INTO active_sessions (tenant_id, recipient_phone, expires_at) 
 		VALUES (?, ?, datetime('now', '+24 hours')) 
 		ON CONFLICT(tenant_id, recipient_phone) 
 		DO UPDATE SET expires_at = datetime('now', '+24 hours')`
-	_, err := db.Writer.Exec(query, tenantID, recipientPhone)
+	_, err := db.Writer.ExecContext(ctx, query, tenantID, recipientPhone)
 	return err
 }
 
 // EnqueueClientWebhook adds a payload to the client egress queue.
-func (db *DB) EnqueueClientWebhook(tenantID string, payload string) error {
+func (db *DB) EnqueueClientWebhook(ctx context.Context, tenantID string, payload string) error {
 	id := ulid.Make().String()
 	query := `INSERT INTO client_webhook_queue (id, tenant_id, payload) VALUES (?, ?, ?)`
-	_, err := db.Writer.Exec(query, id, tenantID, payload)
+	_, err := db.Writer.ExecContext(ctx, query, id, tenantID, payload)
 	return err
 }
 
 // ClaimClientWebhook grabs the oldest queued webhook job and joins tenant info.
-func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
+func (db *DB) ClaimClientWebhook(ctx context.Context) (*ClientWebhookJob, error) {
 	query := `
 		UPDATE client_webhook_queue 
 		SET status = 'processing', next_retry_at = datetime('now', '+1 minute')
@@ -403,7 +405,7 @@ func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
 		RETURNING id, tenant_id, payload, status, retry_count, next_retry_at, created_at`
 
 	var q ClientWebhookJob
-	err := db.Writer.QueryRow(query).Scan(
+	err := db.Writer.QueryRowContext(ctx, query).Scan(
 		&q.ID, &q.TenantID, &q.Payload, &q.Status, &q.RetryCount, &q.NextRetryAt, &q.CreatedAt,
 	)
 
@@ -415,7 +417,7 @@ func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
 	}
 
 	// Join tenant info manually for simplicity or use a CTE in the RETURNING (though RETURNING join is tricky in SQLite)
-	tenant, err := db.GetTenant(q.TenantID)
+	tenant, err := db.GetTenant(ctx, q.TenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -434,15 +436,15 @@ func (db *DB) ClaimClientWebhook() (*ClientWebhookJob, error) {
 }
 
 // MarkClientWebhookFailed updates retry count and next retry time.
-func (db *DB) MarkClientWebhookFailed(id string, retryCount int, nextRetry time.Time) error {
+func (db *DB) MarkClientWebhookFailed(ctx context.Context, id string, retryCount int, nextRetry time.Time) error {
 	query := `UPDATE client_webhook_queue SET status = 'queued', retry_count = ?, next_retry_at = ? WHERE id = ?`
-	_, err := db.Writer.Exec(query, retryCount, nextRetry, id)
+	_, err := db.Writer.ExecContext(ctx, query, retryCount, nextRetry, id)
 	return err
 }
 
 // MarkClientWebhookSuccess marks the job as completed.
-func (db *DB) MarkClientWebhookSuccess(id string) error {
+func (db *DB) MarkClientWebhookSuccess(ctx context.Context, id string) error {
 	query := `UPDATE client_webhook_queue SET status = 'completed' WHERE id = ?`
-	_, err := db.Writer.Exec(query, id)
+	_, err := db.Writer.ExecContext(ctx, query, id)
 	return err
 }

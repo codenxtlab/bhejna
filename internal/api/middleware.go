@@ -28,7 +28,7 @@ func APIKeyMiddleware(database *db.DB) func(http.Handler) http.Handler {
 			}
 
 			key := strings.TrimPrefix(authHeader, "Bearer ")
-			tenant, err := database.GetTenantByAccessToken(key)
+			tenant, err := database.GetTenantByAccessToken(r.Context(), key)
 			if err != nil {
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 				return
